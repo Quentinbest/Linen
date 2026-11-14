@@ -508,7 +508,7 @@ fn steps<F: super::folder::Folder>(
     use super::device_file::{self, Accepted};
     use super::{membership, trust};
     let mut report = Report {
-        not_built: "SP37 step (3)'s unknown identities and removed devices' tails, steps (6)-(8) and (11); within step (5): the quarantine of an object damaged again within 24 hours of a repair and the reader's Try again (SP16, SP12), which are B2b's last part, and the repair of books (Stage 4); within step (4): the open reservations and holds and the marks (SP35) a view carries, and a view found by listing when the device file names none (PS1 lists no directories); within steps (9)-(10): the accepted-by-all marks (SP29, so a hold's naming change waits), peers' reservations and holds in the ledger, books, SY7's rotation when storage is ahead (SP27), the device file's own view (compaction is P3b), its views and proofs lists, its quarantined list (B2b's last part), and the hour's re-upload of own and cached files (SP15)",
+        not_built: "SP37 step (3)'s unknown identities and removed devices' tails, steps (6)-(8) and (11); within step (5): the reader's Try again for a quarantined object (`choice:obj.`, SP12: nothing here writes a choice record or applies one's `clears` to the saved quarantines, so a quarantine has no exit) and the Settings › Sync line that shows quarantines (a peer's `quarantined` list is read by no one), and the repair of books (Stage 4); within step (4): the open reservations and holds and the marks (SP35) a view carries, and a view found by listing when the device file names none (PS1 lists no directories); within steps (9)-(10): the accepted-by-all marks (SP29, so a hold's naming change waits), peers' reservations and holds in the ledger, books, SY7's rotation when storage is ahead (SP27), the device file's own view (compaction is P3b), its views and proofs lists, and the hour's re-upload of own and cached files (SP15)",
         ..Report::default()
     };
     let mut meter = Meter {
@@ -777,6 +777,12 @@ fn steps<F: super::folder::Folder>(
             Ok(Accepted::New(file, lists)) => {
                 // SY23: what the peer found damaged is checked in step (5).
                 device.state.objects.hint(&naming, lists.get("refused"));
+                // SP16: and a repair it lists is first seen now, by this device's time.
+                let seen = device.state.vouched.now() as i64;
+                device
+                    .state
+                    .objects
+                    .see_repairs(&naming, lists.get("repairs"), seen);
                 device
                     .state
                     .heard
@@ -1039,7 +1045,9 @@ fn receive_changes<F: super::folder::Folder>(
                     now,
                     version,
                 )? {
-                    Body::Skip => continue,
+                    // PS6: a damaged read counts its bytes like a good one, so the
+                    // meter is checked after every fetch, whatever it came to.
+                    Body::Skip => {}
                     Body::Halt => {
                         halted = true;
                         break;
@@ -1161,6 +1169,11 @@ pub(super) fn fetch_body<F: super::folder::Folder>(
     if body_over_limit(version) {
         return Ok(Body::Skip);
     }
+    // SP16, SY23: a quarantined object is not fetched by this device by itself.
+    let name = super::crypto::blob_name(naming, &hash);
+    if objects.is_quarantined(&name) {
+        return Ok(Body::Skip);
+    }
     if blobs.is_none() {
         let Some(listed) = list_all(folder, "blobs", meter, report)? else {
             return Ok(Body::Halt);
@@ -1168,7 +1181,6 @@ pub(super) fn fetch_body<F: super::folder::Folder>(
         *blobs = Some(listed.into_iter().map(|e| (e.name.clone(), e)).collect());
     }
     // SP9: a body is stored under its keyed name.
-    let name = super::crypto::blob_name(naming, &hash);
     let Some(blob) = blobs.as_ref().and_then(|b| b.get(&format!("blobs/{name}"))) else {
         return Ok(Body::Skip);
     };
@@ -1192,7 +1204,9 @@ pub(super) fn fetch_body<F: super::folder::Folder>(
                 Body::Got(body)
             }
             Blob::Damaged => {
-                objects.damaged(&name, &hash, size, now);
+                if objects.damaged(&name, &hash, size, now) {
+                    report.objects.quarantined.push(name.clone());
+                }
                 if !report.objects.refused.contains(&name) {
                     report.objects.refused.push(name);
                 }
@@ -1245,7 +1259,13 @@ mod tests {
             json!({"total_ms":100,"last_mono_ms":42,"last_wall_ms":300,"untrusted_wall":true});
         let membership = json!({"first_seen":[[h,-2]],"confirmed":[h],"checkpoint":[h],"quarantined":[[d,mark]],"heads":[[d,h]]});
         let views = json!({"peers":[[d,{"hash":h,"through":7,"tries":2,"refused":false}]],"landing":[[d,{"hash":h,"gen":3,"through":7,"tries":1}]]});
-        let objects = json!({"refused":{"aa":{"hash":"bb","size":9,"at":3}},"repaired":{"cc":{"hash":"dd","at":4,"done":false}},"hints":{"ee":"ff"},"checked":{"gg":5},"listed":6});
+        let objects = json!({"refused":{"aa":{"hash":"bb","size":9,"at":3}},"repaired":{"cc":{"hash":"dd","at":4,"done":false}},"hints":{"ee":"ff"},"checked":{"gg":5},"listed":6,"watched":{"hh":{"seen":7,"good":true}},"quarantined":{"ii":{"at":8,"q":null},"jj":{"at":9,"q":3}}});
+        // A row saved before the quarantine existed still loads, with none.
+        let old: crate::sync::repair::Objects = serde_json::from_value(
+            json!({"refused":{},"repaired":{},"hints":{},"checked":{},"listed":null}),
+        )
+        .unwrap();
+        assert!(old.watched.is_empty() && old.quarantined.is_empty());
         let state = State {
             ledger: serde_json::from_value(ledger.clone()).unwrap(),
             weeks: serde_json::from_value(weeks.clone()).unwrap(),

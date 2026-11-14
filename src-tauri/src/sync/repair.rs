@@ -7,6 +7,18 @@
 //! saves; `files` reads and writes, `journal` keeps the copies, `publish::live_named`
 //! says what a live version names.
 //!
+//! The quarantine (SP16, SY23), from this device's own observations only: it first
+//! sees a `repairs` entry for an object (its own repair, or a peer's in an accepted
+//! device file), then reads the object and finds it good, then finds it damaged
+//! within 24 hours of first seeing the entry by its own vouched time. Then the object
+//! is quarantined: neither fetched nor repaired by this device by itself, and listed
+//! in the device file's `quarantined` with `q`, that file's `counter`. The two orders
+//! that never count are the two this sequence leaves out: a marker seen but no good
+//! read after it, and a good read before the marker was first seen. A peer's
+//! `quarantined` list is read by nobody here (SP16: it is only shown in Settings >
+//! Sync, which isn't built). A quarantine has no exit yet: the reader's Try again
+//! (`choice:obj.`, SP12) isn't built, and nothing calls this code in a release build.
+//!
 //! What a pass checks for damage, which is not every blob in storage:
 //!
 //! 1. the blobs it read for its own use (steps (4) and (5)), when they fail the
@@ -63,6 +75,12 @@ pub const MAX_REFUSED: usize = 256;
 pub const MAX_REPAIRED: usize = 512;
 pub const MAX_HINTS: usize = 256;
 pub const MAX_CHECKED: usize = 512;
+/// PROVISIONAL bounds for the quarantine: the repairs being watched (a peer's new
+/// sighting past it is not taken; this device's own replaces the oldest), and the
+/// objects quarantined (a new quarantine past it is not taken: one that ended by
+/// itself would break SY23's “only the reader's Try again resumes it”).
+pub const MAX_WATCHED: usize = 512;
+pub const MAX_QUARANTINED: usize = 256;
 
 /// SY23: an object found damaged, as storage showed it then.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +102,22 @@ pub struct Repaired {
     pub done: bool,
 }
 
+/// SP16: a `repairs` entry this device has seen for an object: when it first saw it
+/// (this device's vouched time), and whether it has read the object good since.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Watch {
+    pub seen: i64,
+    pub good: bool,
+}
+
+/// SP16: an object this device quarantined. `q` is the counter of the device file
+/// that first listed it, set when that file is signed and never changed after.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Quarantine {
+    pub at: i64,
+    pub q: Option<u64>,
+}
+
 /// PS5: what a device remembers of damaged and missing blobs between passes, by keyed
 /// name (64 hex digits, as SP16's lists say). Every time is this device's own vouched
 /// time (SY17); nothing a peer sent is kept but a name and a hash to check.
@@ -98,6 +132,12 @@ pub struct Objects {
     pub checked: BTreeMap<String, i64>,
     /// When this device last had `blobs/` listed whole.
     pub listed: Option<i64>,
+    /// SP16: the repairs this device has seen (its own, or a peer's `repairs` entry),
+    /// by keyed name. A record stays for `REPAIRS_KEPT_MS` from the first sighting, so
+    /// a peer's entry that its file keeps repeating isn't a new sighting each time.
+    pub watched: BTreeMap<String, Watch>,
+    /// SP16: the objects this device quarantined.
+    pub quarantined: BTreeMap<String, Quarantine>,
 }
 
 /// SP37 (5): what a pass did about damaged and missing blobs.
@@ -109,6 +149,8 @@ pub struct Handled {
     pub repaired: Vec<String>,
     /// Objects left unlooked-at for a later pass at `MAX_REPAIRED`.
     pub deferred: u64,
+    /// Keyed names of the objects this pass quarantined (SP16).
+    pub quarantined: Vec<String>,
 }
 
 impl Objects {
@@ -120,7 +162,8 @@ impl Objects {
         })
     }
 
-    pub fn damaged(&mut self, name: &str, hash: &Hash32, size: u64, now: i64) {
+    /// The blob was read and found damaged. `true` when that quarantines it (SP16).
+    pub fn damaged(&mut self, name: &str, hash: &Hash32, size: u64, now: i64) -> bool {
         self.refused.insert(
             name.to_owned(),
             Refused {
@@ -138,10 +181,97 @@ impl Objects {
             oldest.map(|n| self.refused.remove(&n));
         }
         self.checked.remove(name);
+        self.struck(name, now)
+    }
+
+    /// SP16: whether the object is quarantined here.
+    pub fn is_quarantined(&self, name: &str) -> bool {
+        self.quarantined.contains_key(name)
+    }
+
+    /// SP16: a read found the object damaged. It is quarantined when this device saw
+    /// a `repairs` entry for it, has read it good since, and this is within 24 hours
+    /// of first seeing the entry. Anything else (no entry, no good read since it, or
+    /// later than 24 hours) leaves it as it was. `true` when it is now quarantined.
+    pub fn struck(&mut self, name: &str, now: i64) -> bool {
+        let counts = self
+            .watched
+            .get(name)
+            .is_some_and(|w| w.good && now >= w.seen && now.saturating_sub(w.seen) < REPAIR_GAP_MS);
+        if !counts || self.quarantined.len() >= MAX_QUARANTINED {
+            return false;
+        }
+        self.watched.remove(name);
+        self.quarantined
+            .insert(name.to_owned(), Quarantine { at: now, q: None });
+        true
+    }
+
+    /// SP16: a `repairs` entry for `name` is seen, `own` when this device wrote the
+    /// repair. A peer's entry already seen isn't a new sighting; this device's own
+    /// repair always is.
+    pub fn saw_repair(&mut self, name: &str, now: i64, own: bool) {
+        if self.is_quarantined(name) {
+            return;
+        }
+        if !own && (self.watched.contains_key(name) || self.watched.len() >= MAX_WATCHED) {
+            return;
+        }
+        self.watched.insert(
+            name.to_owned(),
+            Watch {
+                seen: now,
+                good: false,
+            },
+        );
+        while self.watched.len() > MAX_WATCHED {
+            let oldest = self
+                .watched
+                .iter()
+                .min_by_key(|(_, w)| w.seen)
+                .map(|(n, _)| n.clone());
+            oldest.map(|n| self.watched.remove(&n));
+        }
+    }
+
+    /// SP16: a peer's `repairs` entries, each seen now. One whose name isn't the
+    /// keyed name of its hash is dropped, as `hint` drops it.
+    pub fn see_repairs(&mut self, naming: &[u8; 32], items: Option<&Vec<Value>>, now: i64) {
+        for (name, _) in keyed(naming, items).take(MAX_REPAIRED) {
+            self.saw_repair(&name, now, false);
+        }
+    }
+
+    /// SP16: whether a read of the object could still quarantine it: an entry for it
+    /// was first seen less than 24 hours ago.
+    fn watching(&self, name: &str, now: i64) -> bool {
+        self.watched
+            .get(name)
+            .is_some_and(|w| now.saturating_sub(w.seen) < REPAIR_GAP_MS)
+    }
+
+    /// SP16: the device file about to be signed is number `counter`: every
+    /// quarantine not yet numbered was first listed in it.
+    pub fn number(&mut self, counter: u64) {
+        for q in self.quarantined.values_mut().filter(|q| q.q.is_none()) {
+            q.q = Some(counter);
+        }
+    }
+
+    /// SP16: the device file's `quarantined`, `{ "name", "q" }` each.
+    pub fn quarantined_list(&self) -> Vec<Value> {
+        self.quarantined
+            .iter()
+            .filter_map(|(name, q)| q.q.map(|q| json!({"name": name, "q": q})))
+            .collect()
     }
 
     /// The blob was read and is the body its name says.
     pub fn good(&mut self, name: &str, now: i64) {
+        // SP16: a good read after an entry was first seen is the middle of the sequence.
+        if let Some(w) = self.watched.get_mut(name) {
+            w.good = true;
+        }
         self.refused.remove(name);
         self.checked.insert(name.to_owned(), now);
         while self.checked.len() > MAX_CHECKED {
@@ -158,22 +288,15 @@ impl Objects {
     /// whose name isn't the keyed name of its hash is dropped, and the rest wait
     /// for `repair`, which checks them against storage.
     pub fn hint(&mut self, naming: &[u8; 32], items: Option<&Vec<Value>>) {
-        for item in items.into_iter().flatten() {
-            let (Some(name), Some(hash)) = (
-                item["name"].as_str(),
-                item["hash"].as_str().and_then(Hash32::parse),
-            ) else {
-                continue;
-            };
-            if blob_name(naming, &hash) != name {
+        for (name, hash) in keyed(naming, items) {
+            // SP16: nothing is read for a quarantined object.
+            if self.is_quarantined(&name) {
                 continue;
             }
             if self.hints.len() >= MAX_HINTS {
                 break;
             }
-            self.hints
-                .entry(name.to_owned())
-                .or_insert(hash.to_string());
+            self.hints.entry(name).or_insert(hash.to_string());
         }
     }
 
@@ -189,6 +312,8 @@ impl Objects {
     fn prune(&mut self, now: i64) {
         self.repaired
             .retain(|_, r| !r.done || now.saturating_sub(r.at) < REPAIRS_KEPT_MS);
+        self.watched
+            .retain(|_, w| now.saturating_sub(w.seen) < REPAIRS_KEPT_MS);
     }
 
     /// SP16: the device file's `refused`, `{ "name", "hash" }` each.
@@ -208,6 +333,19 @@ impl Objects {
             .map(|(name, r)| json!({"name": name, "hash": r.hash}))
             .collect()
     }
+}
+
+/// SP16: the `{ "name", "hash" }` entries of a peer's list whose name is the keyed
+/// name of its hash, which are the only ones taken from a peer.
+fn keyed<'a>(
+    naming: &'a [u8; 32],
+    items: Option<&'a Vec<Value>>,
+) -> impl Iterator<Item = (String, Hash32)> + 'a {
+    items.into_iter().flatten().filter_map(|item| {
+        let name = item["name"].as_str()?;
+        let hash = item["hash"].as_str().and_then(Hash32::parse)?;
+        (blob_name(naming, &hash) == name).then(|| (name.to_owned(), hash))
+    })
 }
 
 /// What reading one blob came to.
@@ -255,6 +393,8 @@ struct Look {
     known: bool,
     /// A repair begun on an earlier pass: not held to the 24 hours, nor to a recheck.
     pending: bool,
+    /// A refusal an earlier pass saved, looked at again (#234): its retry is this look.
+    saved: bool,
 }
 
 /// SP37 (5): repair. `false` in `report.stopped` when a budget ran out.
@@ -278,7 +418,30 @@ pub(super) fn repair<F: Folder>(
         .listed
         .map_or(true, |t| now.saturating_sub(t) >= LIST_EVERY_MS);
     let hinted = o.hints.keys().any(|n| !o.throttled(n, now));
-    if blobs.is_none() && (due || hinted || o.repaired.values().any(|r| !r.done)) {
+    // #234, SY23: a refusal an earlier pass saved, of which this device holds a copy,
+    // is looked at again when a repair is allowed (not within 24 hours of this device's
+    // own), reading storage first because it may have healed. One an earlier pass
+    // found damaged less than `RETRY_MS` ago, or looked at since, waits out the hour,
+    // and a look counts as the retry (`handle`), so the same damaged blob is read at
+    // most once an hour and never when no repair could follow.
+    let mut saved: Vec<(String, String)> = Vec::new();
+    for (name, r) in &o.refused {
+        let allowed = !o
+            .repaired
+            .get(name)
+            .is_some_and(|x| x.done && now.saturating_sub(x.at) < REPAIR_GAP_MS);
+        if allowed
+            && now.saturating_sub(r.at) >= RETRY_MS
+            && !report.objects.refused.contains(name)
+            && !o.is_quarantined(name)
+            && Hash32::parse(&r.hash).is_some_and(|h| journal::has_body(conn, &h).unwrap_or(false))
+        {
+            saved.push((name.clone(), r.hash.clone()));
+        }
+    }
+    if blobs.is_none()
+        && (due || hinted || !saved.is_empty() || o.repaired.values().any(|r| !r.done))
+    {
         // PS6: counts against the name budget, and shares the listing with step (9).
         if !publish::list_blobs(folder, meter, report, blobs)? {
             return Ok(());
@@ -297,6 +460,7 @@ pub(super) fn repair<F: Folder>(
                     hash,
                     known,
                     pending,
+                    saved: false,
                 }),
             }
         }
@@ -312,6 +476,13 @@ pub(super) fn repair<F: Folder>(
     }
     for (name, hash) in &o.hints {
         add(&mut looks, name, hash, false, false);
+    }
+    for (name, hash) in &saved {
+        add(&mut looks, name, hash, false, false);
+        looks
+            .iter_mut()
+            .filter(|l| &l.name == name)
+            .for_each(|l| l.saved = true);
     }
     // The missing check: bodies this device holds that a live version names. While
     // this device has changes of its own to publish it isn't made: a body of a version
@@ -372,6 +543,19 @@ fn handle<F: Folder>(
 ) -> Result<bool, Error> {
     let Look { name, hash, .. } = look;
     let path = format!("blobs/{name}");
+    // SP16, SY23: a quarantined object is neither fetched nor repaired by this device
+    // by itself; what waited for it is dropped.
+    if device.state.objects.is_quarantined(name) {
+        let objects = &mut device.state.objects;
+        objects.hints.remove(name);
+        objects.repaired.retain(|n, r| r.done || n != name);
+        return Ok(true);
+    }
+    if look.saved {
+        if let Some(r) = device.state.objects.refused.get_mut(name) {
+            r.at = now;
+        }
+    }
     // A peer's report of an object looked at within the hour waits for the hour, so
     // a peer that lists a good object in every device file costs one read an hour.
     if !look.known && !look.pending && device.state.objects.throttled(name, now) {
@@ -387,12 +571,13 @@ fn handle<F: Folder>(
     // A peer's report is looked at once.
     device.state.objects.hints.remove(name);
     let o = &device.state.objects;
-    // SP16: once in 24 hours by this device's clock, whatever it has seen.
-    if !look.pending
+    // SP16: once in 24 hours by this device's clock, whatever it has seen. Within
+    // them an object is still read when that could quarantine it, and not written.
+    let gap = !look.pending
         && o.repaired
             .get(name)
-            .is_some_and(|r| now.saturating_sub(r.at) < REPAIR_GAP_MS)
-    {
+            .is_some_and(|r| now.saturating_sub(r.at) < REPAIR_GAP_MS);
+    if gap && !o.watching(name, now) {
         return Ok(true);
     }
     // SY23: of which this device holds a validated copy; the copy is the body the
@@ -416,23 +601,36 @@ fn handle<F: Folder>(
             // The copy's size bounds the read: a larger object isn't this body.
             match read_blob(folder, listed, hash, copy.len() as u64, report)? {
                 Blob::Good(_) => {
-                    device.state.objects.good(name, now);
                     // A pending repair whose write got through before a crash: when
-                    // isn't known, so the 24 hours run from now.
-                    if let Some(r) = device.state.objects.repaired.get_mut(name) {
+                    // isn't known, so the 24 hours run from now, and so does the watch
+                    // (this read is the first after it).
+                    let objects = &mut device.state.objects;
+                    if let Some(r) = objects.repaired.get_mut(name) {
                         if !r.done {
                             r.at = now;
+                            r.done = true;
+                            objects.saw_repair(name, now, true);
                         }
-                        r.done = true;
                     }
+                    objects.good(name, now);
                     false
                 }
-                Blob::Damaged => true,
+                Blob::Damaged => {
+                    // SP16: damaged again within 24 hours of the repair entry, after a
+                    // good read: quarantined, and not repaired.
+                    if device.state.objects.struck(name, now) {
+                        device.state.objects.hints.remove(name);
+                        report.objects.quarantined.push(name.clone());
+                        save_state(device)?;
+                        return Ok(true);
+                    }
+                    true
+                }
                 Blob::Other => false,
             }
         }
     };
-    if !damaged {
+    if !damaged || gap {
         return Ok(true);
     }
     // SY23: the intent is saved before the write; a stop after it leaves it pending.
@@ -457,6 +655,8 @@ fn handle<F: Folder>(
         r.done = true;
         r.at = now;
     }
+    // SP16: this device's own repair is an entry it sees at once.
+    objects.saw_repair(name, now, true);
     objects.refused.remove(name);
     objects.checked.insert(name.clone(), now);
     report.objects.repaired.push(name.clone());
@@ -1106,6 +1306,520 @@ mod tests {
         let report = pass(&mut kit, 0, REPAIRS_KEPT_MS as u64 + 2 * HOUR);
         assert_eq!(report.objects.repaired, vec![name_of(&hash)], "{report:?}");
         assert_eq!(get(&kit.devices[1], &path), Some(body));
+    }
+
+    /// Device 1 recolours the first highlight and puts the colour back: two changes,
+    /// the second of which names the first change's body again.
+    fn name_the_body_again(kit: &mut Kit) {
+        for color in ["blue", "yellow"] {
+            let row = AnnotationRow {
+                color: color.into(),
+                cfi_range: "epubcfi(/6/4!/4/2,/1:0,/1:4)".into(),
+                ..highlight("book", None, 1_760_000_000_500)
+            };
+            kit.devices[1].db.save_annotation(&row).unwrap();
+            kit.devices[1].publish_pending().unwrap();
+        }
+    }
+
+    fn counter_of(kit: &Kit, i: usize) -> u64 {
+        let kd = &kit.devices[i];
+        let bytes = get(kd, &device_file::device_path(&kd.lib.device)).unwrap();
+        device_file::open(&bytes, &kd.lib.id, &kd.lib.device, &kd.key.public())
+            .unwrap()
+            .counter
+    }
+
+    /// A pass of device `i`, with the blobs it wrote.
+    fn pass_writes(kit: &mut Kit, i: usize, ms: u64) -> (Report, Vec<String>) {
+        let mut p = probe(kit, i);
+        let report = pass_on(kit, i, ms, &Budgets::sy2(), &mut p, &|| 0).unwrap();
+        p.writes.retain(|w| w.starts_with("blobs/"));
+        (report, p.writes)
+    }
+
+    /// Device 2's device file, listing the object in the given lists.
+    fn peer_says(kit: &mut Kit, hash: &Hash32, lists: &[&str]) {
+        let lists = lists
+            .iter()
+            .map(|l| ((*l).to_owned(), vec![entry(hash)]))
+            .collect();
+        kit.devices[2].publish_device_file_with(lists);
+    }
+
+    fn quarantined(kit: &Kit, i: usize) -> Vec<String> {
+        state_of(kit, i).objects.quarantined.into_keys().collect()
+    }
+
+    /// Device 1 publishes three highlights in one change: their paths, bytes, hashes.
+    fn publish_three(kit: &mut Kit) -> Vec<(String, Vec<u8>, Hash32)> {
+        for (n, id) in [ANNO, SECOND, THIRD].into_iter().enumerate() {
+            let row = AnnotationRow {
+                id: id.into(),
+                cfi_range: format!("epubcfi(/6/4!/4/{},/1:0,/1:4)", 2 * n + 2),
+                ..highlight("book", None, 1_760_000_000_500)
+            };
+            kit.devices[1].db.save_annotation(&row).unwrap();
+        }
+        let seq = kit.devices[1].publish_pending().unwrap();
+        let change = kit.devices[1].own_changes(seq).pop().unwrap();
+        change
+            .versions
+            .iter()
+            .filter_map(|v| v["body"]["hash"].as_str().and_then(Hash32::parse))
+            .map(|hash| {
+                let path = format!("blobs/{}", name_of(&hash));
+                (path.clone(), get(&kit.devices[1], &path).unwrap(), hash)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_damaged_read_reaches_the_byte_budget_check_in_a_change_file() {
+        // PS6, #234 (1): a change file naming three damaged bodies. Each damaged read
+        // counts its bytes, and the meter is checked after it as after a good read, so
+        // the pass stops after the first and doesn't read the other two.
+        let mut kit = testkit::library(2);
+        let blobs = publish_three(&mut kit);
+        assert_eq!(blobs.len(), 3);
+        for (path, ..) in &blobs {
+            put(&mut kit, path, &vec![b'x'; 20_000]);
+        }
+        let mut budgets = Budgets::sy2();
+        budgets.bytes = 12_000;
+        let mut p = probe(&kit, 0);
+        let report = pass_on(&mut kit, 0, 0, &budgets, &mut p, &|| 0).unwrap();
+        assert_eq!(report.stopped, Some(Stopped::Bytes), "{report:?}");
+        let total: usize = blobs.iter().map(|(p, ..)| reads(&kit, 0, p)).sum();
+        assert_eq!(total, 1, "one damaged read, then the meter: {report:?}");
+        assert_eq!(report.objects.refused.len(), 1);
+    }
+
+    #[test]
+    fn a_saved_refusal_this_device_holds_a_copy_of_is_repaired_by_a_later_pass() {
+        // #234 (2), SY23: a version names a body this device already holds; storage
+        // has it damaged, and the pass stops on its byte budget right after the damaged
+        // read, before the repair. The version applies without a fetch, so no later
+        // pass reads the object for it; the saved refusal brings it back, once an hour.
+        let mut kit = testkit::library(2);
+        let (path, body, hash) = publish(&mut kit, ANNO, 1);
+        pass(&mut kit, 0, 0);
+        // The colour changed and changed back: the third version names the first body.
+        let before = reads(&kit, 0, &path);
+        name_the_body_again(&mut kit);
+        let again = kit.devices[1].own_changes(3).pop().unwrap();
+        let named: Vec<_> = again
+            .versions
+            .iter()
+            .filter_map(|v| v["body"]["hash"].as_str())
+            .collect();
+        assert_eq!(
+            named,
+            vec![hash.to_string().as_str()],
+            "the same body again"
+        );
+        put(&mut kit, &path, &vec![b'x'; 200_000]);
+        let mut budgets = Budgets::sy2();
+        budgets.bytes = 100_000;
+        let mut p = probe(&kit, 0);
+        let report = pass_on(&mut kit, 0, 1_000, &budgets, &mut p, &|| 0).unwrap();
+        assert_eq!(report.stopped, Some(Stopped::Bytes), "{report:?}");
+        assert_eq!(report.objects.refused, vec![name_of(&hash)]);
+        assert!(report.objects.repaired.is_empty());
+        let after = reads(&kit, 0, &path);
+        assert_eq!(after, before + 1);
+        // Within the hour nothing is read for it, though a repair would be allowed.
+        let (report, written) = pass_writes(&mut kit, 0, HOUR / 2);
+        assert!(
+            report.objects.repaired.is_empty() && written.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(reads(&kit, 0, &path), after, "not read within the hour");
+        // After it: read, found damaged, written again from this device's copy.
+        let (report, written) = pass_writes(&mut kit, 0, HOUR + 2_000);
+        assert_eq!(report.objects.repaired, vec![name_of(&hash)], "{report:?}");
+        assert_eq!(written, vec![path.clone()]);
+        assert_eq!(get(&kit.devices[0], &path), Some(body));
+        assert!(state_of(&kit, 0).objects.refused.is_empty());
+        // And once, not every pass.
+        let (report, written) = pass_writes(&mut kit, 0, 3 * HOUR);
+        assert!(report.objects.repaired.is_empty() && written.is_empty());
+    }
+
+    #[test]
+    fn a_saved_refusal_whose_object_healed_is_read_once_and_cleared() {
+        // #234 (2): storage healed after the refusal; the look reads it good, writes
+        // nothing, and the refusal leaves the list. A refusal this device has no copy
+        // of, or one found damaged less than an hour ago, costs no read.
+        let mut kit = testkit::library(2);
+        let (path, _, hash) = publish(&mut kit, ANNO, 1);
+        pass(&mut kit, 0, 0);
+        seed_refused(&mut kit, 0, &hash, 12);
+        let before = reads(&kit, 0, &path);
+        let (_, written) = pass_writes(&mut kit, 0, HOUR / 2);
+        assert!(written.is_empty());
+        assert_eq!(reads(&kit, 0, &path), before, "found damaged at 0: waits");
+        let (report, written) = pass_writes(&mut kit, 0, HOUR);
+        assert!(
+            report.objects.repaired.is_empty() && written.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(reads(&kit, 0, &path), before + 1);
+        assert!(state_of(&kit, 0).objects.refused.is_empty());
+        assert!(list_of(&kit, 0, "refused").is_empty());
+        // No copy: not looked at.
+        let stranger = identity_hash(b"no copy of this");
+        seed_refused(&mut kit, 0, &stranger, 5);
+        pass(&mut kit, 0, 3 * HOUR);
+        pass(&mut kit, 0, 4 * HOUR);
+        let kept = &state_of(&kit, 0).objects.refused;
+        assert_eq!(
+            kept[&name_of(&stranger)].at,
+            0,
+            "never looked at, so not retried"
+        );
+        assert_eq!(reads(&kit, 0, &path), before + 1);
+    }
+
+    #[test]
+    fn a_saved_refusal_nothing_can_repair_is_looked_at_once_an_hour() {
+        // #234 (2): the copy is held, but no live version names the object (a deleted
+        // highlight), so a look ends without a read or a repair. It still counts as the
+        // retry, so storage isn't listed for it every pass.
+        let mut kit = testkit::library(2);
+        let (_, _, hash) = publish(&mut kit, ANNO, 1);
+        pass(&mut kit, 0, 0);
+        kit.devices[1].db.delete_annotation(ANNO).unwrap();
+        kit.devices[1].publish_pending().unwrap();
+        pass(&mut kit, 0, 60_000);
+        assert!(shown(&kit, 0).is_empty());
+        seed_refused(&mut kit, 0, &hash, 12);
+        let name = name_of(&hash);
+        pass(&mut kit, 0, HOUR);
+        let at = state_of(&kit, 0).objects.refused[&name].at;
+        assert!(at > 0, "looked at, and counted as the retry");
+        pass(&mut kit, 0, HOUR + HOUR / 2);
+        assert_eq!(
+            state_of(&kit, 0).objects.refused[&name].at,
+            at,
+            "not again within the hour"
+        );
+    }
+
+    /// The device holds the body (read good at 0); peer 2's file says the object is
+    /// repaired (and reported, to make this device read it) at `HOUR`, which is read
+    /// good; then storage damages it again. Returns the kit and the object.
+    fn watched_and_good() -> (Kit, String, Vec<u8>, Hash32) {
+        let mut kit = testkit::library(3);
+        let (path, body, hash) = publish(&mut kit, ANNO, 1);
+        pass(&mut kit, 0, 0);
+        peer_says(&mut kit, &hash, &["repairs", "refused"]);
+        let before = reads(&kit, 0, &path);
+        let report = pass(&mut kit, 0, HOUR);
+        assert_eq!(report.accepted.len(), 1, "{report:?}");
+        assert_eq!(reads(&kit, 0, &path), before + 1, "read once, found good");
+        let o = state_of(&kit, 0).objects;
+        assert_eq!(
+            o.watched.get(&name_of(&hash)).map(|w| w.good),
+            Some(true),
+            "{o:?}"
+        );
+        (kit, path, body, hash)
+    }
+
+    #[test]
+    fn an_object_read_good_after_its_marker_and_damaged_again_within_a_day_is_quarantined() {
+        // SP16, SY23: marker seen, good read, then damaged within 24 hours: quarantined,
+        // not repaired, listed with `q` the counter of the file that first lists it, and
+        // `q` is the same in later files. Nothing later reads or writes the object.
+        let (mut kit, path, _, hash) = watched_and_good();
+        put(&mut kit, &path, b"damaged again");
+        peer_says(&mut kit, &hash, &["refused"]);
+        let (report, written) = pass_writes(&mut kit, 0, 2 * HOUR + 1_000);
+        assert_eq!(
+            report.objects.quarantined,
+            vec![name_of(&hash)],
+            "{report:?}"
+        );
+        assert!(report.objects.repaired.is_empty() && written.is_empty());
+        assert_eq!(get(&kit.devices[1], &path), Some(b"damaged again".to_vec()));
+        let q = counter_of(&kit, 0);
+        assert_eq!(
+            list_of(&kit, 0, "quarantined"),
+            vec![json!({"name": name_of(&hash), "q": q})]
+        );
+        assert_eq!(quarantined(&kit, 0), vec![name_of(&hash)]);
+        // A later device file (a new change applied) keeps the same `q`.
+        publish(&mut kit, SECOND, 2);
+        let (report, _) = pass_writes(&mut kit, 0, 3 * HOUR);
+        assert_eq!(report.late.applied + report.received.len(), 1, "{report:?}");
+        assert!(counter_of(&kit, 0) > q);
+        assert_eq!(
+            list_of(&kit, 0, "quarantined"),
+            vec![json!({"name": name_of(&hash), "q": q})]
+        );
+        // A peer reports it again, and it is lost from storage: neither read nor
+        // written, not even once the 24 hours of any repair would have passed.
+        let reads_before = reads(&kit, 0, &path);
+        for (n, ms) in [4 * HOUR, 30 * HOUR, 60 * HOUR].into_iter().enumerate() {
+            peer_says(&mut kit, &hash, &["refused", "repairs"]);
+            if n == 1 {
+                kit.folder.vanish(&path);
+            }
+            let (report, written) = pass_writes(&mut kit, 0, ms);
+            assert!(
+                report.objects.repaired.is_empty() && written.is_empty(),
+                "{n}: {report:?}"
+            );
+            assert_eq!(reads(&kit, 0, &path), reads_before, "{n}");
+            assert!(state_of(&kit, 0).objects.hints.is_empty());
+        }
+        assert!(get(&kit.devices[1], &path).is_none());
+        assert_eq!(list_of(&kit, 0, "repairs"), Vec::<Value>::new());
+        assert_eq!(quarantined(&kit, 0), vec![name_of(&hash)]);
+    }
+
+    #[test]
+    fn a_quarantined_body_isnt_fetched_for_a_version_that_names_it() {
+        // SY23, SP16: a version arriving after the quarantine that names the object is
+        // not read for its body (the same body again after a note was added and taken
+        // away); this device holds the copy, and applies it without a fetch.
+        let (mut kit, path, _, hash) = watched_and_good();
+        put(&mut kit, &path, b"damaged again");
+        peer_says(&mut kit, &hash, &["refused"]);
+        pass(&mut kit, 0, 2 * HOUR + 1_000);
+        assert_eq!(quarantined(&kit, 0), vec![name_of(&hash)]);
+        let before = reads(&kit, 0, &path);
+        name_the_body_again(&mut kit);
+        let report = pass(&mut kit, 0, 3 * HOUR);
+        assert_eq!(report.received.len(), 1, "{report:?}");
+        assert_eq!(reads(&kit, 0, &path), before, "never read: quarantined");
+        assert!(report.objects.refused.is_empty());
+    }
+
+    #[test]
+    fn an_own_repair_then_a_good_read_then_damage_within_a_day_is_quarantined() {
+        // SP16: the device's own repair is a repairs entry it sees at once. A read that
+        // finds the object good, and one a few hours later that finds it damaged, within
+        // the 24 hours it can't repair again: quarantined, and not written.
+        let mut kit = testkit::library(3);
+        let (path, body, hash) = publish(&mut kit, ANNO, 1);
+        pass(&mut kit, 0, 0);
+        kit.folder.vanish(&path);
+        let report = pass(&mut kit, 0, HOUR);
+        assert_eq!(report.objects.repaired, vec![name_of(&hash)], "{report:?}");
+        assert_eq!(get(&kit.devices[1], &path), Some(body));
+        // A peer reports it: read inside the repair's 24 hours, found good, not written.
+        peer_says(&mut kit, &hash, &["refused"]);
+        let (report, written) = pass_writes(&mut kit, 0, 3 * HOUR);
+        assert!(
+            report.objects.repaired.is_empty() && written.is_empty(),
+            "{report:?}"
+        );
+        assert!(state_of(&kit, 0).objects.watched[&name_of(&hash)].good);
+        put(&mut kit, &path, b"damaged again");
+        peer_says(&mut kit, &hash, &["refused"]);
+        let (report, written) = pass_writes(&mut kit, 0, 5 * HOUR);
+        assert_eq!(
+            report.objects.quarantined,
+            vec![name_of(&hash)],
+            "{report:?}"
+        );
+        assert!(written.is_empty());
+        assert_eq!(list_of(&kit, 0, "quarantined").len(), 1);
+        // Past the 24 hours: still not repaired by itself.
+        peer_says(&mut kit, &hash, &["refused"]);
+        let (report, written) = pass_writes(&mut kit, 0, 30 * HOUR);
+        assert!(
+            report.objects.repaired.is_empty() && written.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(get(&kit.devices[1], &path), Some(b"damaged again".to_vec()));
+    }
+
+    #[test]
+    fn a_marker_before_the_repaired_file_and_a_repaired_file_before_its_marker_dont_count() {
+        // SP16: the two orders that never count. (a) The marker arrives, and the object
+        // is read damaged (the original damage) with no good read since: not
+        // quarantined; this device, holding a copy, repairs it. (b) The object was read
+        // good before the marker was first seen: the marker, then damage, doesn't count.
+        for order in ["marker first", "file first"] {
+            let mut kit = testkit::library(3);
+            let (path, _, hash) = publish(&mut kit, ANNO, 1);
+            pass(&mut kit, 0, 0);
+            let lists = ["repairs", "refused"];
+            if order == "marker first" {
+                put(&mut kit, &path, b"the first damage");
+                peer_says(&mut kit, &hash, &lists);
+            } else {
+                // Read good at 0, before the marker; the marker alone is no reason to read.
+                peer_says(&mut kit, &hash, &["repairs"]);
+                pass(&mut kit, 0, HOUR);
+                assert!(!state_of(&kit, 0).objects.watched[&name_of(&hash)].good);
+                put(&mut kit, &path, b"damaged after");
+                peer_says(&mut kit, &hash, &["refused"]);
+            }
+            let (report, written) = pass_writes(&mut kit, 0, 2 * HOUR);
+            assert!(report.objects.quarantined.is_empty(), "{order}: {report:?}");
+            assert_eq!(report.objects.repaired, vec![name_of(&hash)], "{order}");
+            assert_eq!(written, vec![path.clone()], "{order}");
+            assert!(quarantined(&kit, 0).is_empty(), "{order}");
+            assert!(list_of(&kit, 0, "quarantined").is_empty(), "{order}");
+        }
+    }
+
+    #[test]
+    fn damage_more_than_24_hours_after_the_marker_isnt_quarantined() {
+        // SP16: the 24 hours run from first seeing the entry, by this device's clock.
+        let (mut kit, path, body, hash) = watched_and_good();
+        put(&mut kit, &path, b"damaged again");
+        peer_says(&mut kit, &hash, &["refused"]);
+        let (report, written) = pass_writes(&mut kit, 0, HOUR + 24 * HOUR + 1_000);
+        assert!(report.objects.quarantined.is_empty(), "{report:?}");
+        assert_eq!(report.objects.repaired, vec![name_of(&hash)]);
+        assert_eq!(written, vec![path.clone()]);
+        assert_eq!(get(&kit.devices[1], &path), Some(body));
+        assert!(quarantined(&kit, 0).is_empty());
+    }
+
+    #[test]
+    fn a_peers_quarantined_entry_changes_nothing_this_device_does() {
+        // SP16: a device quarantines from its own observations alone: a peer's
+        // `quarantined` (and its `refused`) doesn't stop this device repairing, or
+        // fetching, or put anything in its own list.
+        let mut kit = testkit::library(3);
+        let (path, body, hash) = publish(&mut kit, ANNO, 1);
+        pass(&mut kit, 0, 0);
+        put(&mut kit, &path, b"damaged");
+        let lists = BTreeMap::from([
+            ("refused".to_owned(), vec![entry(&hash)]),
+            (
+                "quarantined".to_owned(),
+                vec![json!({"name": name_of(&hash), "q": 1})],
+            ),
+        ]);
+        kit.devices[2].publish_device_file_with(lists);
+        let (report, written) = pass_writes(&mut kit, 0, HOUR);
+        assert_eq!(report.accepted.len(), 1, "{report:?}");
+        assert_eq!(report.objects.repaired, vec![name_of(&hash)], "{report:?}");
+        assert_eq!(written, vec![path.clone()]);
+        assert_eq!(get(&kit.devices[1], &path), Some(body));
+        assert!(quarantined(&kit, 0).is_empty());
+        assert!(list_of(&kit, 0, "quarantined").is_empty());
+    }
+
+    #[test]
+    fn a_peers_repairs_entry_with_another_name_is_ignored() {
+        // SP16: an entry whose name isn't the keyed name of its hash, or isn't an entry
+        // at all, is dropped; a good one is seen.
+        let mut kit = testkit::library(3);
+        let (_, _, hash) = publish(&mut kit, ANNO, 1);
+        pass(&mut kit, 0, 0);
+        let lists = BTreeMap::from([(
+            "repairs".to_owned(),
+            vec![
+                json!({"name": "ab".repeat(32), "hash": hash.to_string()}),
+                json!({"name": name_of(&hash)}),
+                json!("junk"),
+            ],
+        )]);
+        kit.devices[2].publish_device_file_with(lists);
+        let report = pass(&mut kit, 0, HOUR);
+        assert_eq!(report.accepted.len(), 1, "{report:?}");
+        assert!(state_of(&kit, 0).objects.watched.is_empty());
+        peer_says(&mut kit, &hash, &["repairs"]);
+        pass(&mut kit, 0, 2 * HOUR);
+        assert_eq!(
+            state_of(&kit, 0).objects.watched.keys().collect::<Vec<_>>(),
+            vec![&name_of(&hash)]
+        );
+    }
+
+    #[test]
+    fn the_quarantine_works_on_a_fetch_too() {
+        // SP16: a damaged read by a fetch (a version naming the body again) counts
+        // like one by a peer's report, and is listed as refused and quarantined.
+        let mut kit = testkit::library(3);
+        let (path, _, hash) = publish(&mut kit, ANNO, 1);
+        pass(&mut kit, 0, 0);
+        // The marker, and a version that names the body again: fetched, found good.
+        peer_says(&mut kit, &hash, &["repairs"]);
+        name_the_body_again(&mut kit);
+        let report = pass(&mut kit, 0, HOUR);
+        assert_eq!(report.received.len(), 1, "{report:?}");
+        assert!(state_of(&kit, 0).objects.watched[&name_of(&hash)].good);
+        // Another version names it, and storage has it damaged (a change's upload
+        // writes its bodies, so the damage comes after): the fetch finds it damaged.
+        name_the_body_again(&mut kit);
+        put(&mut kit, &path, b"damaged again");
+        let report = pass(&mut kit, 0, 2 * HOUR);
+        assert_eq!(
+            report.objects.quarantined,
+            vec![name_of(&hash)],
+            "{report:?}"
+        );
+        assert_eq!(report.objects.refused, vec![name_of(&hash)]);
+        assert_eq!(quarantined(&kit, 0), vec![name_of(&hash)]);
+    }
+
+    #[test]
+    fn what_the_quarantine_keeps_has_a_bound() {
+        // PS5: a peer can't grow the watched repairs or the quarantines without bound,
+        // and a repeated entry keeps its first time.
+        let mut o = Objects::default();
+        for n in 0..(MAX_WATCHED + 5) {
+            o.saw_repair(&format!("{n:064}"), n as i64, false);
+        }
+        assert_eq!(o.watched.len(), MAX_WATCHED);
+        assert!(!o.watched.contains_key(&format!("{MAX_WATCHED:064}")));
+        // This device's own repair is always taken, and the oldest goes.
+        o.saw_repair("own", 10_000, true);
+        assert_eq!(o.watched.len(), MAX_WATCHED);
+        assert!(o.watched.contains_key("own") && !o.watched.contains_key(&format!("{:064}", 0)));
+        // A repeated entry is not a new sighting; this device's own repair is.
+        let mut few = Objects::default();
+        few.saw_repair("a", 1, false);
+        few.saw_repair("a", 99_999, false);
+        assert_eq!(few.watched["a"].seen, 1);
+        few.good("a", 5);
+        few.saw_repair("a", 99_999, false);
+        assert!(few.watched["a"].good, "nor does it forget the good read");
+        few.saw_repair("a", 99_999, true);
+        assert_eq!(
+            few.watched["a"],
+            Watch {
+                seen: 99_999,
+                good: false
+            }
+        );
+        // Entries go after twice the gap.
+        o.prune(REPAIRS_KEPT_MS + 5_000);
+        assert_eq!(o.watched.keys().collect::<Vec<_>>(), vec!["own"]);
+        // Quarantines: capped, numbered once, listed only when numbered.
+        let mut o = Objects::default();
+        for n in 0..(MAX_QUARANTINED + 3) {
+            let name = format!("{n:064}");
+            o.saw_repair(&name, 0, true);
+            o.good(&name, 1);
+            assert_eq!(o.struck(&name, 2), n < MAX_QUARANTINED, "{n}");
+        }
+        assert_eq!(o.quarantined.len(), MAX_QUARANTINED);
+        assert!(o.quarantined_list().is_empty());
+        o.number(7);
+        o.number(9);
+        assert_eq!(o.quarantined_list().len(), MAX_QUARANTINED);
+        assert!(o.quarantined.values().all(|q| q.q == Some(7)));
+        // At the bound a hint for a quarantined object isn't kept, and nothing watches it.
+        let quarantined = identity_hash(b"quarantined");
+        o.quarantined
+            .insert(name_of(&quarantined), Quarantine { at: 0, q: None });
+        o.hint(
+            &NAMING,
+            Some(&vec![entry(&identity_hash(b"x")), entry(&quarantined)]),
+        );
+        assert_eq!(o.hints.len(), 1);
+        o.saw_repair(&format!("{:064}", 0), 0, true);
+        assert!(!o.watched.contains_key(&format!("{:064}", 0)));
     }
 
     #[test]

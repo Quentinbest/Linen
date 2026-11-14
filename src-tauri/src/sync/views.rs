@@ -345,7 +345,8 @@ fn fetch<F: Folder>(
             now,
             &record.version,
         )? {
-            pass::Body::Skip => continue,
+            // PS6: a damaged read is counted, so the meter is checked after it too.
+            pass::Body::Skip => {}
             pass::Body::Halt => break,
             pass::Body::Got(bytes) => {
                 held += bytes.len() as u64;
@@ -1349,6 +1350,25 @@ mod tests {
         assert!(report.viewed.is_empty() && report.stopped.is_none());
         assert_eq!(note(&kit), Some(Some("note 6".into())));
         assert_eq!(reads(&kit, &index), 1, "the view isn't read again");
+    }
+
+    #[test]
+    fn a_damaged_read_reaches_the_byte_budget_check_in_a_view() {
+        // PS6, #234 (1): a view naming 31 bodies, all damaged in storage. Each damaged
+        // read counts its bytes and the meter is checked after it, so the view's fetch
+        // stops after the first and doesn't read the other 30.
+        let mut kit = rig(2, 6, 6, "");
+        let blobs = files_in(&kit, "blobs");
+        assert!(blobs.len() > 10);
+        for path in &blobs {
+            put(&mut kit, path, &vec![b'x'; 5_000]);
+        }
+        let mut b = Budgets::sy2();
+        b.bytes = without_bodies(6, 6) + 1;
+        let (report, _) = pass_within(&mut kit, 0, &b);
+        assert_eq!(report.stopped, Some(Stopped::Bytes), "{report:?}");
+        let total: usize = blobs.iter().map(|p| reads(&kit, p)).sum();
+        assert_eq!(total, 1, "one damaged read, then the meter: {report:?}");
     }
 
     /// Device 1 has a view; device 2 has one change, and is read after device 1
