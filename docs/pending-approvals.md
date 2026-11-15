@@ -15,7 +15,7 @@ Approved so far; the record is in `docs/decisions.md`:
 - items 102, 105, 106 and 108–112, on 2026-10-17 (sync; 111 and 112 as (a)).
 - items 113 (as (a)) and 114, on 2026-10-18 (the sync protocol).
 
-Waiting for the owner: none. Item 126 (what a device keeps of a backlog one pass can't read, #208) was approved on 2026-11-14 as recommended. Items 121–125 (the revised sync plan, `docs/sync-delivery-plan.md`) were approved on 2026-11-12, each as (a). Item 98 was approved on 2026-10-25, and items 99–101, 103, 104 and 107 (sync) and 117 (Reading Lens) on 2026-10-26. Item 97 was approved on 2026-10-14. Items 53 and 54 were approved on 2026-10-06 (reader review). The items below are kept for their details.
+Waiting for the owner: item 127 (whether a quarantine also stops a reader's own change from uploading the body, #235). Item 126 (what a device keeps of a backlog one pass can't read, #208) was approved on 2026-11-14 as recommended. Items 121–125 (the revised sync plan, `docs/sync-delivery-plan.md`) were approved on 2026-11-12, each as (a). Item 98 was approved on 2026-10-25, and items 99–101, 103, 104 and 107 (sync) and 117 (Reading Lens) on 2026-10-26. Item 97 was approved on 2026-10-14. Items 53 and 54 were approved on 2026-10-06 (reader review). The items below are kept for their details.
 
 ## Review fixes (2026-09-26)
 
@@ -465,3 +465,8 @@ From the progress review of 2026-11-11. **Approved 2026-11-12, each as (a)** (�
     - **(c)** Apply the prefix as it is read, before the checkpoint is reached. This changes SP18 (a chain that doesn't lead to the floor would already be applied) and is not recommended.
     *Recommendation:* (a) now, then (b) as its own stage after the slice (SD2) if the slice or a real folder shows a backlog that no view covers. A view is the protocol's answer for a long backlog, and a device that has been away a week has one (SP17, SP36). Nothing is lost meanwhile: the peer's files stay in storage.
     **Approved 2026-11-14, as recommended:** (a) now; (b) as its own stage after the slice if the slice or a real folder shows a backlog that no view covers.
+
+127. **Whether a quarantine also stops step (9) from uploading the body for a change of this device's own (#235, SP16, SY23, SP33).** A quarantined object is neither fetched nor repaired by this device by itself (sync pass P2b-3 (4)). If the object is then missing from storage and a new change of this device names the same body (a highlight recoloured and set back, say), step (9) uploads the body as it does for any change, so the object is in storage again without the reader's Try again. SP16 and SY23 say “no device fetches or repairs it again by itself”; they don't say whether publishing a reader's own change counts.
+    - (a) **Leave publication alone** (what is built). The upload belongs to a change the reader made, not to a repair the device chose; the quarantine still stops every fetch and repair of the object.
+    - (b) **Gate publication too.** The change that names a quarantined body waits, with every later change of this device behind it (a chain is published in order), until Try again clears the quarantine. Try again isn't built, so until it is such a chain would not move.
+    *Recommendation:* (a). (b) holds back the reader's own later changes from every other device for the sake of an object the reader is still using, and has no exit today. If (b) is wanted, it belongs with Try again.

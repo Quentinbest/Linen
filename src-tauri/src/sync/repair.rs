@@ -273,6 +273,12 @@ impl Objects {
             w.good = true;
         }
         self.refused.remove(name);
+        self.looked(name, now);
+    }
+
+    /// The object was looked at now, whatever the look came to: a peer's report of
+    /// it waits `RECHECK_MS` from here.
+    pub fn looked(&mut self, name: &str, now: i64) {
         self.checked.insert(name.to_owned(), now);
         while self.checked.len() > MAX_CHECKED {
             let oldest = self
@@ -630,7 +636,13 @@ fn handle<F: Folder>(
             }
         }
     };
-    if !damaged || gap {
+    if !damaged {
+        return Ok(true);
+    }
+    if gap {
+        // Read and found damaged, with no repair allowed yet: the look still counts
+        // for the hour, so peers' reports can't have it read again every pass.
+        device.state.objects.looked(name, now);
         return Ok(true);
     }
     // SY23: the intent is saved before the write; a stop after it leaves it pending.
@@ -1820,6 +1832,31 @@ mod tests {
         assert_eq!(o.hints.len(), 1);
         o.saw_repair(&format!("{:064}", 0), 0, true);
         assert!(!o.watched.contains_key(&format!("{:064}", 0)));
+    }
+
+    #[test]
+    fn a_blob_damaged_inside_the_repair_gap_is_read_once_an_hour_on_peers_reports() {
+        // SP16: repaired, then damaged before any good read: no quarantine and no
+        // second repair yet. Peers' reports of it get one read an hour, not one a pass.
+        let mut kit = testkit::library(3);
+        let (path, body, hash) = publish(&mut kit, ANNO, 1);
+        pass(&mut kit, 0, 0);
+        kit.folder.vanish(&path);
+        let report = pass(&mut kit, 0, HOUR);
+        assert_eq!(report.objects.repaired.len(), 1, "{report:?}");
+        put(&mut kit, &path, &vec![b'x'; body.len()]);
+        let before = reads(&kit, 0, &path);
+        for (n, ms) in [2 * HOUR + 60_000, 2 * HOUR + 120_000]
+            .into_iter()
+            .enumerate()
+        {
+            let lists = BTreeMap::from([("refused".to_owned(), vec![entry(&hash)])]);
+            kit.devices[2].publish_device_file_with(lists);
+            let report = pass(&mut kit, 0, ms);
+            assert!(report.objects.repaired.is_empty(), "{n}: {report:?}");
+            assert!(report.objects.quarantined.is_empty(), "{n}: {report:?}");
+            assert_eq!(reads(&kit, 0, &path), before + 1, "{n}");
+        }
     }
 
     #[test]
