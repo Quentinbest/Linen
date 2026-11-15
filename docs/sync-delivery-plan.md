@@ -70,6 +70,8 @@ B2b grew in turn (SD9, 2026-11-14): step (5)'s later fetches of bodies with #229
 
 B2b-2 grew in turn (SD9, 2026-11-14): the damaged blobs and the device file's `refused`, the repair of lost or damaged blobs from this device's copy with `repairs`, and the reading of peers' `refused` came to about 1,000 changed lines with their tests, and the quarantine (SP16) needs saved state and tests of its own (what a device saw first, in what order, and when), so B2b-2 is built as two PRs: B2b-2, repair, `refused` and `repairs`; B2b-3, the quarantine of an object damaged again within 24 hours of a repair, the `quarantined` list, the reading of peers' `repairs`, and the reader's Try again (`choice:obj.`, SP12). B2 is done when B2a, B2b-1, B2b-2, B2b-3 and B2c are.
 
+B2b-3 grew in turn (SD9, 2026-11-14): the quarantine (SP16) with its saved state, the `quarantined` list with `q`, the reading of peers' `repairs` and #234's two leftovers fill the part, and the reader's Try again (`choice:obj.`, SP12) is split off: the pass code has no way to write a choice record or to apply one, and the screen that offers it, Settings › Sync, is Stage 3. It is built with step (6) in P3a (where applied records are read) and Settings › Sync, and until then a quarantine has no exit, which no release build can reach (PS8). B2 is done when B2a, B2b-1, B2b-2, B2b-3 and B2c are.
+
 Books (steps (7)–(8)) and compaction and cleanup (step (11)) are not in the slice: the slice syncs no book file, and it runs for days, not weeks.
 
 #197 (P2) was closed on 2026-11-08, before P2b was built; B1 and B2 need it reopened or issues of their own (section 6).

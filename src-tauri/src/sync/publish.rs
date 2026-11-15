@@ -816,6 +816,9 @@ fn device_file_step<F: Folder>(
     }
     if device_file::pending(device.store, &lib.id)?.is_empty() {
         let fields = device_fields(device, report)?;
+        // SP16: a quarantine's `q` is saved before the file that carries it is signed,
+        // so a stop between the two leaves the same number for the next attempt.
+        save_state(device)?;
         let same = checked
             .flatten()
             .is_some_and(|file| file.overflow.is_empty() && says_the_same(&fields, &file.fields));
@@ -903,6 +906,13 @@ fn device_fields(device: &mut Device<'_>, report: &Report) -> Result<Fields, Err
     // SY23, SP16: the blobs found damaged and the ones written again.
     lists.insert("refused".to_owned(), device.state.objects.refused_list());
     lists.insert("repairs".to_owned(), device.state.objects.repairs_list());
+    // SP16: a quarantine first listed in this file is numbered with its counter, which
+    // the state keeps from then on (`device_file_step` saves it before the file is signed).
+    device.state.objects.number(state.counter + 1);
+    lists.insert(
+        "quarantined".to_owned(),
+        device.state.objects.quarantined_list(),
+    );
     lists.extend(super::ages::lists(
         &device.state.ages,
         &mut device.state.marks,
