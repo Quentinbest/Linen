@@ -46,6 +46,8 @@ pub mod repair;
 pub mod restore;
 pub mod retention;
 pub mod shared;
+pub mod strangers;
+pub mod tails;
 pub mod trust;
 pub mod view;
 pub mod views;

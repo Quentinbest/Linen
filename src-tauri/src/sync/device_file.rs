@@ -348,6 +348,22 @@ fn opt_hash(v: Option<&Value>) -> Result<Option<Hash32>> {
     }
 }
 
+/// SP37 (3), SY34: the key a device file names for its signer, read before anything
+/// is checked. Nothing is believed from it: `open` then holds the file to a key whose
+/// hash is the device's ID, so a file naming another key than its ID's is refused.
+pub fn named_key(bytes: &[u8], library: &Id16) -> Option<[u8; 32]> {
+    if bytes.len() > MAX_DEVICE_FILE {
+        return None;
+    }
+    let e = envelope::open(bytes, "device", library).ok()?;
+    e.body
+        .get("key")
+        .and_then(Value::as_str)
+        .and_then(crate::sync::ids::b64url_decode)?
+        .try_into()
+        .ok()
+}
+
 /// SP16: opens `device`'s device file, checked against the key that device's ID
 /// names and signed for its counter. The caller has fetched at most
 /// `MAX_DEVICE_FILE` bytes.
