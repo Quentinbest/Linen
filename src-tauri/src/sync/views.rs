@@ -373,31 +373,46 @@ fn newer_keys(view: &View, have: u64) -> HashSet<[u8; 16]> {
         .collect()
 }
 
-/// SP18: apply an opened view with the change files after it. Before anything is
-/// applied the view's `week` claims are taken (SP17: they only add protection) and
-/// the view is marked as landing, both saved (PS5). Once it has applied, the peer's
-/// floor takes its generation (SP18), the claims are proven, and the mark is cleared
-/// in the same save. A stop anywhere between the first save and the last leaves the
-/// mark, and `finish_landings` finishes it on a later pass. One the floor or the chain
-/// refuses is set aside and isn't read again until the peer names another.
+/// SP18: an opened view applied with the change files after it, in step (6) under
+/// the store's lock. Before anything is applied the view's `week` claims are taken
+/// (SP17: they only add protection) and the view is marked as landing, both saved
+/// (PS5). The floor's generation and the claims' proof wait for `finish`, after the
+/// lock's transaction has committed: a device store written inside it could run ahead
+/// of a database that then rolled back.
+pub(super) struct Applied {
+    view: View,
+    got: Result<read::ViewReceived, ChainError>,
+}
+
+impl Applied {
+    /// Whether the apply held something back for the reader (SY26) or for a pause.
+    pub(super) fn held_back(&self) -> bool {
+        self.got.as_ref().is_ok_and(|g| {
+            g.received
+                .iter()
+                .any(|r| matches!(r, Received::Asks | Received::Paused))
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(super) fn receive(
+pub(super) fn apply(
     device: &mut Device<'_>,
-    report: &mut Report,
+    conn: &rusqlite::Connection,
     naming: &[u8; 32],
     peer: &DeviceId,
     key: &[u8; 32],
     opened: Opened,
     files: Vec<(Vec<u8>, Vec<Vec<u8>>)>,
     now_ms: i64,
-) -> Result<(), Error> {
+) -> Result<Applied, Error> {
     let Opened { view, bodies } = opened;
     let lib = device.lib;
     device
         .state
         .weeks
-        .receive_view(device.conn, &lib, naming, *peer, &view)?;
-    // PS5: the mark is saved before the apply commits, never after.
+        .receive_view(conn, &lib, naming, *peer, &view)?;
+    // PS5: the mark is saved with the apply, never after.
     device.state.views.landing.insert(
         *peer,
         Landing {
@@ -407,27 +422,45 @@ pub(super) fn receive(
             tries: 0,
         },
     );
-    save_state(device)?;
+    super::pass::save_state_in(device, conn)?;
     let floor = device
         .store
         .library(&lib.id)
         .and_then(|l| l.floors.get(&peer.to_string()))
         .cloned()
         .unwrap_or_default();
-    match read::receive_view(
-        device.conn,
-        &lib,
-        &view,
-        peer,
-        key,
-        &floor,
-        false,
-        bodies,
-        files,
-        now_ms,
-    ) {
+    let got = read::receive_view(
+        conn, &lib, &view, peer, key, &floor, false, bodies, files, now_ms,
+    );
+    // This device's own database or store failed: not the peer's doing. The pass
+    // stops, and the lock's transaction rolls back with the mark in it.
+    if let Err(e @ (ChainError::Journal(_) | ChainError::Store(_))) = got {
+        return Err(Error::Chain(e));
+    }
+    Ok(Applied { view, got })
+}
+
+/// SP18: what a view's apply came to, once the lock's transaction has committed: the
+/// peer's floor takes its generation, the claims are proven, and the mark is cleared
+/// in the same save. A stop between the commit and this leaves the mark, and
+/// `finish_landings` finishes it on a later pass. A view the floor or the chain
+/// refused is set aside and isn't read again until the peer names another.
+pub(super) fn finish(
+    device: &mut Device<'_>,
+    report: &mut Report,
+    naming: &[u8; 32],
+    peer: &DeviceId,
+    applied: Applied,
+) -> Result<(), Error> {
+    let Applied { view, got } = applied;
+    let lib = device.lib;
+    match got {
         Ok(got) => {
-            if matches!(got.received.first(), Some(Received::Applied { .. })) {
+            let received = matches!(
+                got.received.first(),
+                Some(Received::Applied { .. } | Received::Asks)
+            ) && apply::seen(&*device.db.lock()?, &lib, *peer)? >= view.through.s;
+            if received {
                 device_file::raise_view_generation(
                     device.ks,
                     device.store,
@@ -438,18 +471,15 @@ pub(super) fn receive(
                 device
                     .state
                     .weeks
-                    .receive_view(device.conn, &lib, naming, *peer, &view)?;
+                    .receive_view(&*device.db.lock()?, &lib, naming, *peer, &view)?;
                 device.state.views.landing.remove(peer);
                 report.viewed.push(*peer);
-            } else if apply::seen(device.conn, &lib, *peer)? < view.through.s {
+            } else if apply::seen(&*device.db.lock()?, &lib, *peer)? < view.through.s {
                 // Nothing of it landed (it waits, or the reader is asked first).
                 device.state.views.landing.remove(peer);
             }
             save_state(device)?;
         }
-        // This device's own database or store failed: not the peer's doing. The mark
-        // stays, and the next pass finishes whatever the apply did commit.
-        Err(e @ (ChainError::Journal(_) | ChainError::Store(_))) => return Err(Error::Chain(e)),
         Err(e) => {
             if let Some(note) = device.state.views.peers.get_mut(peer) {
                 note.refused = true;
@@ -492,7 +522,7 @@ pub(super) fn finish_landings<F: Folder>(
         .collect();
     for (peer, landing) in marks {
         let trusted = report.trusted.contains(&peer);
-        if !trusted || apply::seen(device.conn, &lib, peer)? < landing.through {
+        if !trusted || apply::seen(&*device.db.lock()?, &lib, peer)? < landing.through {
             device.state.views.landing.remove(&peer);
             save_state(device)?;
             continue;
@@ -502,7 +532,7 @@ pub(super) fn finish_landings<F: Folder>(
         // SP30: nothing is read of a quarantined peer, nor of one this device has
         // stopped receiving from.
         let skip = device.state.membership.quarantined.contains_key(&peer)
-            || apply::stopped(device.conn, &lib, peer)?;
+            || apply::stopped(&*device.db.lock()?, &lib, peer)?;
         let (Some(key), false) = (key, skip) else {
             device.state.views.landing.remove(&peer);
             save_state(device)?;
@@ -530,10 +560,13 @@ pub(super) fn finish_landings<F: Folder>(
         match got {
             Got::Halt => return Ok(true),
             Got::Ready(opened) => {
-                device
-                    .state
-                    .weeks
-                    .receive_view(device.conn, &lib, naming, peer, &opened.view)?;
+                device.state.weeks.receive_view(
+                    &*device.db.lock()?,
+                    &lib,
+                    naming,
+                    peer,
+                    &opened.view,
+                )?;
                 device.state.views.landing.remove(&peer);
             }
             Got::Skip | Got::Wait => {
@@ -588,7 +621,8 @@ mod tests {
         let kd = &mut kit.devices[i];
         let state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
         let mut device = Device {
-            conn: kd.db.conn(),
+            db: crate::sync::pass::Database::Test(&kd.db),
+            root: kd.root.path(),
             lib: kd.lib,
             store: &mut kd.store,
             ks: ks.unwrap_or(&kd.ks),
@@ -648,6 +682,99 @@ mod tests {
             }
         }
         kit
+    }
+
+    #[test]
+    fn guarded_view_recovers_its_receipt_before_resuming_pending_records() {
+        use crate::sync::{
+            guard,
+            pass::{Point, HOOK},
+        };
+        let mut kit = testkit::library(2);
+        let peer = kit.devices[1].lib.device;
+        for i in 0..105 {
+            let id = format!("{i:08x}-6f7a-4b1c-9d2e-4f5a6b7c8d9e");
+            let cfi = format!("epubcfi(/6/4!/4/{},/1:0,/1:4)", 2 * i + 10);
+            kit.devices[1]
+                .db
+                .save_annotation(&annotation(&id, &cfi, "kept"))
+                .unwrap();
+        }
+        kit.devices[1].publish_pending().unwrap();
+        kit.devices[1].publish_view(1);
+        HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(|point, _| {
+                if point == Point::Committed {
+                    return Err(Error::Folder(std::io::Error::other("after commit")));
+                }
+                Ok(())
+            }))
+        });
+        let mut folder = kit.folder.view(&reader(&kit, 0));
+        let failed = pass_on(&mut kit, 0, &mut folder, None, &Budgets::sy2(), &|| 0);
+        HOOK.with(|h| *h.borrow_mut() = None);
+        assert!(failed.is_err());
+        let kd = &kit.devices[0];
+        let saved = State::load(kd.db.conn(), &kd.lib.id).unwrap();
+        assert!(saved.views.landing.contains_key(&peer));
+        assert!(guard::asking(kd.db.conn(), &kd.lib).unwrap().is_some());
+        let pending: i64 = kd
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_versions WHERE applied = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(pending > 0);
+        let (paused, state) = pass(&mut kit, 0);
+        assert!(paused.asking.is_some());
+        assert!(!state.views.landing.contains_key(&peer));
+        let kd = &kit.devices[0];
+        assert!(guard::asking(kd.db.conn(), &kd.lib).unwrap().is_some());
+        assert_eq!(
+            kd.db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_versions WHERE applied = 0",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            pending
+        );
+        assert!(
+            kd.db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM sync_undo", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+                > 0
+        );
+        guard::answer(
+            kd.db.conn(),
+            &kd.lib,
+            guard::Answer::Apply,
+            READ.wall_ms as i64,
+        )
+        .unwrap();
+        pass(&mut kit, 0);
+        pass(&mut kit, 0);
+        let kd = &kit.devices[0];
+        let rows = kd.db.annotations("book").unwrap();
+        assert_eq!(rows.len(), 105);
+        assert!(rows.iter().all(|r| r.note.as_deref() == Some("kept")));
+        assert_eq!(
+            kd.db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_versions WHERE applied = 0",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
     }
 
     fn peer_of(kit: &Kit) -> DeviceId {
@@ -1266,8 +1393,7 @@ mod tests {
     #[test]
     fn bodies_past_the_run_cap_are_left_for_step_five() {
         // SP15 (the 32 MB cap): the view lands, and a body that would take it past
-        // the cap isn't read with it; its version waits, and step 5 takes it in the
-        // same pass (B2b).
+        // the cap isn't read with it; its version waits until the next step 5.
         let mut kit = rig(2, 4, 6, "");
         let mut b = Budgets::sy2();
         b.run_bytes = 1;
@@ -1280,6 +1406,8 @@ mod tests {
             total as u64 - report.late.fetched <= 4,
             "{total} bodies read"
         );
+        assert!(report.late.waiting > 0, "{report:?}");
+        let (report, _) = pass_within(&mut kit, 0, &Budgets::sy2());
         assert!(report.late.fetched > 0, "{report:?}");
         assert_eq!(note(&kit), Some(Some("note 6".into())));
     }

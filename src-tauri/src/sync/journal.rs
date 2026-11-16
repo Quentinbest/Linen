@@ -42,6 +42,47 @@ pub enum JournalError {
 
 pub type Result<T> = std::result::Result<T, JournalError>;
 
+/// SY32, SP37 (6): a unit of work that nests. It is a `SAVEPOINT`: on its own it
+/// opens and, committed, ends a transaction, as `unchecked_transaction` does; inside
+/// the transaction that holds the store's write lock (`pass`, step 6) it is released
+/// into it, so what the pass applies is one transaction and a unit that is dropped
+/// (a change SY26 holds back) takes back only itself. Dropped uncommitted, it rolls
+/// back.
+pub(crate) struct Unit<'c> {
+    conn: &'c Connection,
+    open: bool,
+}
+
+impl<'c> Unit<'c> {
+    pub(crate) fn begin(conn: &'c Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch("SAVEPOINT linen_unit")?;
+        Ok(Self { conn, open: true })
+    }
+
+    pub(crate) fn commit(mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("RELEASE linen_unit")?;
+        self.open = false;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for Unit<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+impl Drop for Unit<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self
+                .conn
+                .execute_batch("ROLLBACK TO linen_unit; RELEASE linen_unit");
+        }
+    }
+}
+
 /// A library this device has joined, and this device's ID in it (SP28).
 #[derive(Clone, Copy, Debug)]
 pub struct Library {

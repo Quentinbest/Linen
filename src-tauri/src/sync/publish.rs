@@ -66,6 +66,10 @@ pub(super) fn publish<F: Folder>(
     devices: &[Listed<F::Token>],
 ) -> Result<(), Error> {
     let lib = device.lib;
+    if super::guard::paused(&*device.db.lock()?, &lib)? {
+        report.paused = true;
+        return Ok(());
+    }
     // This device's own device file as storage has it, once checked this pass.
     let mut checked = None;
     if anything_to_publish(device)? {
@@ -80,13 +84,20 @@ pub(super) fn publish<F: Folder>(
             &mut checked,
         )?;
         // Whatever stopped it, what is still waiting is said.
-        report.unsent = journal::unsent(device.conn, &lib)?.len() as u64;
+        report.unsent = journal::unsent(&*device.db.lock()?, &lib)?.len() as u64;
         if !go || report.stopped.is_some() {
             return Ok(());
         }
     }
+    super::pass::at(super::pass::Point::After(9), &*device.db.lock()?)?;
+    if super::guard::paused(&*device.db.lock()?, &lib)? {
+        report.paused = true;
+        return Ok(());
+    }
     // SP37 (10): after the changes are in storage, never before.
-    device_file_step(device, folder, meter, report, devices, checked)
+    device_file_step(device, folder, meter, report, devices, checked)?;
+    super::pass::at(super::pass::Point::After(10), &*device.db.lock()?)?;
+    Ok(())
 }
 
 /// A change signed and not yet in storage, one numbered and never signed, or a
@@ -94,9 +105,10 @@ pub(super) fn publish<F: Folder>(
 pub(super) fn anything_to_publish(device: &Device<'_>) -> Result<bool, Error> {
     let lib = device.lib;
     let last = device.store.library(&lib.id).ok_or(Error::NoIdentity)?.seq;
+    let conn = device.db.lock()?;
     Ok(!chain::pending(device.store, &lib.id)?.is_empty()
-        || journal::numbered_unsigned(device.conn, &lib, last)?
-        || !journal::unsent(device.conn, &lib)?.is_empty())
+        || journal::numbered_unsigned(&conn, &lib, last)?
+        || !journal::unsent(&conn, &lib)?.is_empty())
 }
 
 /// `false` when publication can't go on this pass: storage is ahead of this device,
@@ -122,7 +134,8 @@ fn publish_waiting<F: Folder>(
     {
         let marks =
             frontier::stored_marks(device.store.library(&lib.id).ok_or(Error::NoIdentity)?)?;
-        let held = |d: &DeviceId, s: u64| held_of(device.conn, &lib, d, s);
+        let db = device.db;
+        let held = |d: &DeviceId, s: u64| held_of(&*db.lock().ok()?, &lib, d, s);
         let (none, mine) = (BTreeSet::new(), BTreeSet::from([lib.device]));
         let progress = Progress {
             accepted: &marks,
@@ -379,7 +392,7 @@ fn send<F: Folder>(
         if is_there(blobs, written, &object) {
             continue;
         }
-        let body = journal::body(device.conn, &hash)?.filter(|b| identity_hash(b) == hash);
+        let body = journal::body(&*device.db.lock()?, &hash)?.filter(|b| identity_hash(b) == hash);
         let Some(body) = body else {
             // Nothing to write; a peer waits for the body (SY28).
             report
@@ -433,8 +446,8 @@ struct Item {
 /// SP33: whether some live version names the body: a head of a record that
 /// carries it. A deleted record's body, or one an edit replaced, is not live.
 pub(super) fn live_named(device: &Device<'_>, hash: &Hash32) -> Result<bool, Error> {
-    let keys: Vec<String> = device
-        .conn
+    let conn = device.db.lock()?;
+    let keys: Vec<String> = conn
         .prepare(
             "SELECT DISTINCT key FROM sync_versions
              WHERE library = ?1 AND seq IS NOT NULL AND applied = 1
@@ -452,7 +465,7 @@ pub(super) fn live_named(device: &Device<'_>, hash: &Hash32) -> Result<bool, Err
         let Some((key, _)) = Key::parse(&key) else {
             continue;
         };
-        let record = journal::record_of(device.conn, &device.lib, &key, journal::Which::Applied)?;
+        let record = journal::record_of(&conn, &device.lib, &key, journal::Which::Applied)?;
         if record
             .heads(&HashSet::new())
             .iter()
@@ -468,7 +481,8 @@ pub(super) fn live_named(device: &Device<'_>, hash: &Hash32) -> Result<bool, Err
 /// live or not: content it has named before.
 fn known(device: &Device<'_>, hash: &Hash32) -> Result<bool, Error> {
     Ok(device
-        .conn
+        .db
+        .lock()?
         .query_row(
             "SELECT 1 FROM sync_versions WHERE library = ?1 AND seq IS NOT NULL
              AND json_extract(raw, '$.body.hash') = ?2 LIMIT 1",
@@ -514,7 +528,8 @@ fn plan(
             .library(&device.lib.id)
             .ok_or(Error::NoIdentity)?,
     )?;
-    let held = |d: &DeviceId, s: u64| held_of(device.conn, &device.lib, d, s);
+    let db = device.db;
+    let held = |d: &DeviceId, s: u64| held_of(&*db.lock().ok()?, &device.lib, d, s);
     let (none, mine) = (BTreeSet::new(), BTreeSet::from([me]));
     let progress = Progress {
         accepted: &marks,
@@ -528,7 +543,8 @@ fn plan(
     let reserved: BTreeSet<Hash32> = ledger.open_reservations(me).map(|(_, r)| r.name).collect();
     let holds: Vec<_> = ledger.open_holds(me).collect();
     let mut out = Vec::new();
-    for version in journal::unsent(device.conn, &device.lib)? {
+    let unsent = journal::unsent(&*device.db.lock()?, &device.lib)?;
+    for version in unsent {
         let (class, blob) = match &version.content {
             // Books arrive in Stage 4: a `bookFile` version, with its book, waits.
             _ if version.kind == Kind::BookFile => (Class::Waiting, None),
@@ -676,7 +692,7 @@ fn rounds<F: Folder>(
             .map(|i| i.version.key.clone())
             .collect();
         let signed = chain::publish_with(
-            device.conn,
+            &*device.db.lock()?,
             &lib,
             device.ks,
             device.store,
@@ -709,7 +725,7 @@ fn rounds<F: Folder>(
             if !seen.insert(blob.name.clone()) {
                 continue;
             }
-            let Some(body) = journal::body(device.conn, &blob.hash)? else {
+            let Some(body) = journal::body(&*device.db.lock()?, &blob.hash)? else {
                 report.set_aside.push((
                     format!("blobs/{}", blob.name),
                     "its body is not kept here".into(),
@@ -738,8 +754,9 @@ fn rounds<F: Folder>(
             .filter(|i| i.class != Class::Ready)
             .map(|i| i.version.key.clone())
             .collect();
-        if let Some(signed) = chain::publish_with(
-            device.conn,
+        let db = device.db;
+        let signed = chain::publish_with(
+            &*db.lock()?,
             &lib,
             device.ks,
             device.store,
@@ -747,7 +764,8 @@ fn rounds<F: Folder>(
             &[],
             &device.state.ledger,
             &withheld,
-        )? {
+        )?;
+        if let Some(signed) = signed {
             if !send(
                 device,
                 folder,
@@ -868,7 +886,7 @@ fn device_fields(device: &mut Device<'_>, report: &Report) -> Result<Fields, Err
         .and_then(|v| v.as_str())
         .and_then(Hash32::parse);
     let marks = frontier::stored_marks(state)?;
-    let (ms, n) = journal::clock_of(device.conn, &lib)?;
+    let (ms, n) = journal::clock_of(&*device.db.lock()?, &lib)?;
     // SP16: for every other device whose changes it has applied, the latest, with
     // that device's own signature. A signature saved before the change was applied
     // vouches for nothing until it has been.
@@ -877,8 +895,8 @@ fn device_fields(device: &mut Device<'_>, report: &Report) -> Result<Fields, Err
         if *peer == me {
             continue;
         }
-        let seen = super::apply::seen(device.conn, &lib, *peer)?;
-        let held = chain::held_hash(device.conn, &lib, peer, seen)?;
+        let seen = super::apply::seen(&*device.db.lock()?, &lib, *peer)?;
+        let held = chain::held_hash(&*device.db.lock()?, &lib, peer, seen)?;
         let Some(sigs) = device.state.sigs.peers.get_mut(peer) else {
             continue;
         };
@@ -890,7 +908,7 @@ fn device_fields(device: &mut Device<'_>, report: &Report) -> Result<Fields, Err
         }
         // It may vouch for less than it has applied, never for more.
         if let Some(c) = &sigs.confirmed {
-            let still = chain::held_hash(device.conn, &lib, peer, c.s)?;
+            let still = chain::held_hash(&*device.db.lock()?, &lib, peer, c.s)?;
             if c.s <= seen && still == Some(c.h) {
                 if let Some(sig) = b64url_decode(&c.sig).and_then(|b| b.try_into().ok()) {
                     applied.insert(*peer, (Mark { s: c.s, h: c.h }, sig));
@@ -1023,7 +1041,8 @@ mod tests {
     ) -> Result<pass::Report, pass::Error> {
         let state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
         let mut device = pass::Device {
-            conn: kd.db.conn(),
+            db: crate::sync::pass::Database::Test(&kd.db),
+            root: kd.root.path(),
             lib: kd.lib,
             store: &mut kd.store,
             ks: &kd.ks,

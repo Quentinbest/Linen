@@ -125,6 +125,12 @@ pub fn paused(conn: &Connection, lib: &Library) -> Result<bool> {
     Ok(state.as_deref() == Some("paused"))
 }
 
+/// SY26, SY27: nothing can be applied now: sync is paused, or the reader is asked and
+/// hasn't answered. (Once they answer Apply, the change they let through can be.)
+pub(crate) fn stalled(conn: &Connection, lib: &Library) -> Result<bool> {
+    Ok(paused(conn, lib)? || question(conn, lib)?.is_some_and(|q| q.asking && !q.approved))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Gate {
     /// No question open: apply, counting.
@@ -167,7 +173,9 @@ pub(crate) fn gate(
                 && q.seq == Some(s as i64)
                 && q.hash.as_deref() == Some(h.to_string().as_str())
         }
-        None => q.device.is_none(),
+        // An approved question may now be resumed from durable pending rows;
+        // the approved version set limits what that pass can apply.
+        None => true,
     };
     Ok(if q.approved && same {
         Gate::Approved
@@ -553,18 +561,30 @@ pub(crate) fn applied(
     // A note tombstone is counted with its highlight's deletion when that deletion
     // was counted in this window and the note hasn't changed since (an earlier
     // look at the entries, before this change moves them on).
-    let note_counted_with_highlight = p.version.kind == Kind::Note && {
-        let last = |key: String| -> Result<Option<i64>> {
-            Ok(conn.query_row(
-                "SELECT MAX(turn) FROM sync_undo WHERE library = ?1 AND key = ?2 AND at > ?3",
-                params![lib.id.to_string(), key, since],
-                |r| r.get(0),
-            )?)
+    let note_counted_with_highlight = p.version.kind == Kind::Note
+        && {
+            let last = |key: String| -> Result<Option<i64>> {
+                Ok(conn.query_row(
+                    "SELECT MAX(turn) FROM sync_undo WHERE library = ?1 AND key = ?2 AND at > ?3",
+                    params![lib.id.to_string(), key, since],
+                    |r| r.get(0),
+                )?)
+            };
+            let highlight = last(format!("annotation:{subject}"))?;
+            let note = last(p.version.key.as_str().to_owned())?;
+            let in_window = highlight.is_some_and(|h| note.map_or(true, |n| n < h));
+            // SP37 may split a single change at the question. Its note tombstone
+            // can then arrive after the answer even though the highlight already
+            // counted that same deletion before it.
+            let same_change: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sync_undo h WHERE h.library = ?1 AND h.key = ?2
+                 AND h.device = ?3 AND h.seq = ?4 AND NOT EXISTS
+                 (SELECT 1 FROM sync_undo n WHERE n.library = h.library AND n.key = ?5 AND n.turn > h.turn))",
+            params![lib.id.to_string(), format!("annotation:{subject}"), p.version.device.to_string(), p.seq as i64, p.version.key.as_str()],
+            |r| r.get(0),
+        )?;
+            in_window || same_change
         };
-        let highlight = last(format!("annotation:{subject}"))?;
-        let note = last(p.version.key.as_str().to_owned())?;
-        highlight.is_some_and(|h| note.map_or(true, |n| n < h))
-    };
     // Since the last answer, one entry a record: what it was before the first
     // change (kept), and the last change (moved on). So the journal holds what Stop
     // syncing needs however long the counting runs, bounded by the records changed.
@@ -956,11 +976,16 @@ mod tests {
     /// Receives `batch`, letting it through if the reader is asked.
     fn let_through(s: &Store, lib: &Library, batch: &Batch, now: i64) {
         if receive(s.conn(), lib, batch, now).unwrap() == Received::Asks {
-            answer(s.conn(), lib, Answer::Apply, now).unwrap();
-            assert!(matches!(
-                receive(s.conn(), lib, batch, now).unwrap(),
-                Received::Applied { .. }
-            ));
+            for _ in 0..100 {
+                if asking(s.conn(), lib).unwrap().is_some() {
+                    answer(s.conn(), lib, Answer::Apply, now).unwrap();
+                }
+                let n = apply_pending(s.conn(), lib, now).unwrap();
+                if n == 0 && asking(s.conn(), lib).unwrap().is_none() {
+                    return;
+                }
+            }
+            panic!("pending changes did not settle after 100 iterations");
         }
     }
 
@@ -991,6 +1016,25 @@ mod tests {
     }
 
     #[test]
+    fn threshold_crossing_keeps_the_prefix_applied() {
+        let now = crate::store::now_ms();
+        let (mut a, la, b, lb, ids) = shared(30, now);
+        let batch = delete(&mut a, &la, &ids);
+        assert_eq!(
+            receive(b.conn(), &lb, &batch, now + HOUR).unwrap(),
+            Received::Asks
+        );
+        let count: i64 = b.conn().query_row(
+            "SELECT COUNT(*) FROM sync_counted WHERE library = ?1 AND what = 'deleted' AND at > ?2",
+            params![lb.id.to_string(), now], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            count, DELETED_NOTES,
+            "SP37 commits the prefix before asking"
+        );
+    }
+
+    #[test]
     fn many_deletions_in_one_change_wait_for_the_reader() {
         let now = crate::store::now_ms();
         let (mut a, la, b, lb, ids) = shared(30, now);
@@ -1003,17 +1047,15 @@ mod tests {
         );
         assert_eq!(
             b.annotations("book-b").unwrap().len(),
-            30,
-            "nothing applied"
+            5,
+            "the first 25 highlights are applied before the crossing"
         );
-        assert_eq!(asking(b.conn(), &lb).unwrap().map(|c| c.deleted), Some(60));
+        assert_eq!(asking(b.conn(), &lb).unwrap().map(|c| c.deleted), Some(52));
         // Nothing else is applied meanwhile, from any device.
         assert_eq!(apply_pending(b.conn(), &lb, later).unwrap(), 0);
         answer(b.conn(), &lb, Answer::Apply, later).unwrap();
-        assert!(matches!(
-            receive(b.conn(), &lb, &batch, later + 1).unwrap(),
-            Received::Applied { .. }
-        ));
+        assert!(apply_pending(b.conn(), &lb, later + 1).unwrap() > 0);
+        apply_pending(b.conn(), &lb, later + 1).unwrap();
         assert!(b.annotations("book-b").unwrap().is_empty());
         assert!(asking(b.conn(), &lb).unwrap().is_none(), "answered");
     }
@@ -1062,8 +1104,8 @@ mod tests {
             Received::Asks
         );
         let back = answer(b.conn(), &lb, Answer::StopSyncing, now + 3 * HOUR).unwrap();
-        // 20 highlights and their 20 notes, as they were, text and all.
-        assert_eq!(back, 40);
+        // The safe prefix includes another five highlights from the second change.
+        assert_eq!(back, 45);
         let rows = b.annotations("book-b").unwrap();
         assert_eq!(rows.len(), 40);
         assert!(rows
@@ -1555,13 +1597,13 @@ mod tests {
                 params![lb.id.to_string(), crate::sync::apply::tests::SYNC_BOOK],
             )
             .unwrap();
-        assert_eq!(apply_pending(b.conn(), &lb, now + HOUR).unwrap(), 0);
-        assert_eq!(asking(b.conn(), &lb).unwrap().map(|c| c.added), Some(219));
+        assert_eq!(apply_pending(b.conn(), &lb, now + HOUR).unwrap(), 200);
+        assert_eq!(asking(b.conn(), &lb).unwrap().map(|c| c.added), Some(201));
         // No body arrives meanwhile to make more ready.
         assert!(!crate::sync::apply::receive_body(b.conn(), &lb, &late).unwrap());
         answer(b.conn(), &lb, Answer::Apply, now + HOUR).unwrap();
         // Two days on, the place is due, but it wasn't in the question.
-        assert_eq!(apply_pending(b.conn(), &lb, now + 2 * DAY_MS).unwrap(), 219);
+        assert_eq!(apply_pending(b.conn(), &lb, now + 2 * DAY_MS).unwrap(), 1);
         assert!(b.position("book-b").unwrap().is_none());
         assert!(asking(b.conn(), &lb).unwrap().is_none());
         assert!(crate::sync::apply::receive_body(b.conn(), &lb, &late).unwrap());
@@ -1582,12 +1624,15 @@ mod tests {
             Received::Asks
         );
         answer(b.conn(), &lb, Answer::Apply, now + HOUR).unwrap();
-        receive(b.conn(), &lb, &batch, now + HOUR + 1).unwrap();
+        assert!(apply_pending(b.conn(), &lb, now + HOUR + 1).unwrap() > 0);
+        apply_pending(b.conn(), &lb, now + HOUR + 1).unwrap();
         let next = delete(&mut a, &la, &ids[30..]);
-        assert!(matches!(
-            receive(b.conn(), &lb, &next, now + 2 * HOUR).unwrap(),
-            Received::Applied { .. }
-        ));
+        let got = receive(b.conn(), &lb, &next, now + 2 * HOUR).unwrap();
+        assert!(
+            matches!(got, Received::Applied { .. }),
+            "{got:?}; question {:?}",
+            asking(b.conn(), &lb).unwrap()
+        );
     }
 
     #[test]
@@ -1712,13 +1757,14 @@ mod tests {
             Received::Asks
         );
         answer(b.conn(), &lb, Answer::Apply, now + HOUR).unwrap();
-        receive(b.conn(), &lb, &batch, now + 2 * HOUR).unwrap();
+        assert!(apply_pending(b.conn(), &lb, now + 2 * HOUR).unwrap() > 0);
+        apply_pending(b.conn(), &lb, now + 2 * HOUR).unwrap();
         let more = delete(&mut a, &la, &ids[30..]);
         receive(b.conn(), &lb, &more, now + 3 * HOUR).unwrap();
         assert!(b.annotations("book-b").unwrap().is_empty());
-        // Stop syncing puts back the 10 since the answer, not the 30 approved.
+        // Stop syncing puts back changes after the answer, including the suffix.
         answer(b.conn(), &lb, Answer::StopSyncing, now + 4 * HOUR).unwrap();
-        assert_eq!(b.annotations("book-b").unwrap().len(), 10);
+        assert_eq!(b.annotations("book-b").unwrap().len(), 14);
     }
 
     #[test]
@@ -1778,14 +1824,12 @@ mod tests {
         );
         answer(b.conn(), &lb, Answer::Apply, now + HOUR).unwrap();
         // Two days on, C's note is due and resolves with A's change.
-        assert!(matches!(
-            receive(b.conn(), &lb, &a2, now + 2 * DAY_MS).unwrap(),
-            Received::Applied { .. }
-        ));
+        assert!(apply_pending(b.conn(), &lb, now + 2 * DAY_MS).unwrap() > 0);
+        apply_pending(b.conn(), &lb, now + 2 * DAY_MS).unwrap();
         let counted: i64 = b
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM sync_counted WHERE approved = 0 AND at > ?1",
+                "SELECT COUNT(*) FROM sync_counted WHERE approved = 0 AND what = 'changed' AND at > ?1",
                 [now + HOUR],
                 |r| r.get(0),
             )
@@ -1807,13 +1851,12 @@ mod tests {
         answer(b.conn(), &lb, Answer::Apply, now + HOUR).unwrap();
         // C's 51 rewrites resolve on the retry: past 50, asked again.
         let later = now + 2 * DAY_MS;
-        assert_eq!(receive(b.conn(), &lb, &a2, later).unwrap(), Received::Asks);
+        assert!(apply_pending(b.conn(), &lb, later).unwrap() > 0);
+        apply_pending(b.conn(), &lb, later).unwrap();
         assert_eq!(asking(b.conn(), &lb).unwrap().map(|c| c.changed), Some(51));
         answer(b.conn(), &lb, Answer::Apply, later).unwrap();
-        assert!(matches!(
-            receive(b.conn(), &lb, &a2, later + 1).unwrap(),
-            Received::Applied { .. }
-        ));
+        assert!(apply_pending(b.conn(), &lb, later + 1).unwrap() > 0);
+        apply_pending(b.conn(), &lb, later + 1).unwrap();
         let rows = b.annotations("book-b").unwrap();
         let rewritten = rows
             .iter()
@@ -1874,17 +1917,20 @@ mod tests {
             Received::Asks
         );
         answer(b.conn(), &lb, Answer::Apply, now + HOUR).unwrap();
-        // Another change at the same sequence isn't covered by the approval.
+        // Another change at the same sequence cannot replace the durable receipt.
         let mut other = batch.clone();
         other.hash = super::super::ids::Hash32([0xee; 32]);
         assert_eq!(
             receive(b.conn(), &lb, &other, now + HOUR).unwrap(),
-            Received::Asks
+            Received::Repeat
         );
-        assert!(matches!(
-            receive(b.conn(), &lb, &batch, now + HOUR).unwrap(),
-            Received::Applied { .. }
-        ));
+        assert_eq!(
+            super::super::chain::held_hash(b.conn(), &lb, &batch.device, batch.seq).unwrap(),
+            Some(batch.hash)
+        );
+        assert!(apply_pending(b.conn(), &lb, now + HOUR).unwrap() > 0);
+        apply_pending(b.conn(), &lb, now + HOUR).unwrap();
+        assert!(b.annotations("book-b").unwrap().is_empty());
     }
 
     #[test]
@@ -1967,10 +2013,8 @@ mod tests {
         assert_eq!(asking(b.conn(), &lb).unwrap().map(|c| c.changed), Some(0));
         answer(b.conn(), &lb, Answer::Apply, now + HOUR).unwrap();
         // Two days on, the rewrites are due: counted, so asked again.
-        assert_eq!(
-            receive(b.conn(), &lb, &batch, now + 2 * DAY_MS).unwrap(),
-            Received::Asks
-        );
+        assert!(apply_pending(b.conn(), &lb, now + 2 * DAY_MS).unwrap() > 0);
+        apply_pending(b.conn(), &lb, now + 2 * DAY_MS).unwrap();
         assert_eq!(asking(b.conn(), &lb).unwrap().map(|c| c.changed), Some(51));
     }
 
@@ -2019,7 +2063,7 @@ mod tests {
             receive(b.conn(), &lb, &batch, now + HOUR).unwrap(),
             Received::Asks
         );
-        assert_eq!(asking(b.conn(), &lb).unwrap().map(|c| c.deleted), Some(60));
+        assert_eq!(asking(b.conn(), &lb).unwrap().map(|c| c.deleted), Some(52));
     }
 
     #[test]
@@ -2940,19 +2984,29 @@ mod tests {
         let batch = publish_next(a.conn(), &la).unwrap().unwrap();
         assert_eq!(receive(b.conn(), &lb, &batch, now).unwrap(), Received::Asks);
         answer(b.conn(), &lb, Answer::Apply, now).unwrap();
-        // Meanwhile B's book is taken away: the approved versions wait.
-        b.conn().execute("DELETE FROM sync_books", []).unwrap();
-        receive(b.conn(), &lb, &batch, now + 1).unwrap();
-        assert!(b.annotations("book-b").unwrap().is_empty());
-        assert!(asking(b.conn(), &lb).unwrap().is_none(), "settled");
-        // The book comes back: they apply, not counted again, not asked again.
+        // The approved record is temporarily held for its clock.
+        let (writer, seq, key) = approved_versions(b.conn(), &lb)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
         b.conn()
             .execute(
-                "INSERT INTO sync_books (library, sync_id, book_id) VALUES (?1, ?2, 'book-b')",
-                params![lb.id.to_string(), crate::sync::apply::tests::SYNC_BOOK],
+                "UPDATE sync_versions SET applied = -2 WHERE device = ?1 AND seq = ?2 AND key = ?3",
+                params![writer, seq as i64, key],
             )
             .unwrap();
-        assert_eq!(apply_pending(b.conn(), &lb, now + HOUR).unwrap(), 220);
+        assert_eq!(apply_pending(b.conn(), &lb, now + 1).unwrap(), 0);
+        assert_eq!(b.annotations("book-b").unwrap().len(), 110);
+        assert!(asking(b.conn(), &lb).unwrap().is_none(), "settled");
+        // The record becomes ready: it remains approved.
+        b.conn()
+            .execute(
+                "UPDATE sync_versions SET applied = 0 WHERE device = ?1 AND seq = ?2 AND key = ?3",
+                params![writer, seq as i64, key],
+            )
+            .unwrap();
+        assert_eq!(apply_pending(b.conn(), &lb, now + HOUR).unwrap(), 20);
         assert!(asking(b.conn(), &lb).unwrap().is_none());
     }
 
@@ -3026,19 +3080,29 @@ mod tests {
         let first = publish_next(a.conn(), &la).unwrap().unwrap();
         assert_eq!(receive(b.conn(), &lb, &first, now).unwrap(), Received::Asks);
         answer(b.conn(), &lb, Answer::Apply, now).unwrap();
-        b.conn().execute("DELETE FROM sync_books", []).unwrap();
-        receive(b.conn(), &lb, &first, now + 1).unwrap();
+        let (writer, seq, key) = approved_versions(b.conn(), &lb)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        b.conn()
+            .execute(
+                "UPDATE sync_versions SET applied = -2 WHERE device = ?1 AND seq = ?2 AND key = ?3",
+                params![writer, seq as i64, key],
+            )
+            .unwrap();
+        assert_eq!(apply_pending(b.conn(), &lb, now + 1).unwrap(), 0);
         // An unrelated question is asked and answered meanwhile.
         ask(b.conn(), &lb, None, &[], &Counts::default(), false, now + 2).unwrap();
         answer(b.conn(), &lb, Answer::Apply, now + 2).unwrap();
         settle(b.conn(), &lb).unwrap();
         b.conn()
             .execute(
-                "INSERT INTO sync_books (library, sync_id, book_id) VALUES (?1, ?2, 'book-b')",
-                params![lb.id.to_string(), crate::sync::apply::tests::SYNC_BOOK],
+                "UPDATE sync_versions SET applied = 0 WHERE device = ?1 AND seq = ?2 AND key = ?3",
+                params![writer, seq as i64, key],
             )
             .unwrap();
-        assert_eq!(apply_pending(b.conn(), &lb, now + HOUR).unwrap(), 220);
+        assert_eq!(apply_pending(b.conn(), &lb, now + HOUR).unwrap(), 20);
         assert!(asking(b.conn(), &lb).unwrap().is_none(), "not asked again");
     }
 

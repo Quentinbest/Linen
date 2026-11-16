@@ -136,7 +136,7 @@ mod tests {
                 bodies: vec![body],
             };
             let now = crate::store::now_ms();
-            let mut got = apply::receive(c.db.conn(), &c.lib, &batch, now).unwrap();
+            let got = apply::receive(c.db.conn(), &c.lib, &batch, now).unwrap();
             if got == Received::Asks {
                 // SY26: approve the real guard prompt; keep receiving valid edits.
                 crate::sync::guard::answer(
@@ -146,12 +146,14 @@ mod tests {
                     now,
                 )
                 .unwrap();
-                got = apply::receive(c.db.conn(), &c.lib, &batch, now).unwrap();
+                let applied = apply::apply_pending(c.db.conn(), &c.lib, now).unwrap();
+                assert!(applied > 0, "the approved pending edit resumes");
+            } else {
+                assert!(
+                    matches!(got, Received::Applied { set_aside: 0, .. }),
+                    "sequence {seq}: {got:?}"
+                );
             }
-            assert!(
-                matches!(got, Received::Applied { set_aside: 0, .. }),
-                "sequence {seq}: {got:?}"
-            );
             let before = raw_bytes(&c, &b);
             let result = prune(c.db.conn(), &c.lib, &|_, _, _| true).unwrap();
             assert_eq!(before - raw_bytes(&c, &b), result.raw_bytes as i64);
