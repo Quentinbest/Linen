@@ -2,6 +2,11 @@
 
 use std::{fmt::Debug, hash::Hash, io};
 
+#[cfg(target_os = "macos")]
+mod disk;
+#[cfg(target_os = "macos")]
+pub use disk::{Disk, DiskToken};
+
 /// SY2: one entry issued by a listing. `name` is relative to `Linen/`, including
 /// `dir`, so SP7 can classify it without turning its opaque token into a path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +80,7 @@ fn valid_path(path: &str) -> bool {
     parts.len() <= 4
         && parts.iter().all(|part| {
             !part.is_empty()
+                && part.len() <= 255
                 && !part.starts_with('.')
                 && part
                     .bytes()
