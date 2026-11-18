@@ -19,6 +19,7 @@ import {
 import { spikeF } from './f-search'
 import { spikeG } from './g-extension-network'
 import { spikeLang } from './i18n'
+import { spikeSync } from './sync-slice'
 import { spikeB, spikeBTrackpad, spikeC } from './interactive'
 
 const SPIKES: Record<string, () => Promise<SpikeResult>> = {
@@ -39,6 +40,7 @@ const SPIKES: Record<string, () => Promise<SpikeResult>> = {
   x3: spikeX3,
   seed500: spikeSeed500,
   lang: spikeLang,
+  sync: spikeSync,
 }
 
 async function main() {

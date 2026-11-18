@@ -80,7 +80,13 @@ export interface OpenedView {
 /** Create a foliate-view inside #reader at the given size and open a corpus book. */
 export async function openView(
   name: string,
-  opts: { width?: number; height?: number; fontPx?: number; onBook?: (book: Book) => void } = {},
+  opts: {
+    width?: number
+    height?: number
+    fontPx?: number
+    lastLocation?: string
+    onBook?: (book: Book) => void
+  } = {},
 ): Promise<OpenedView> {
   const host = document.getElementById('reader')!
   host.replaceChildren()
@@ -103,7 +109,7 @@ export async function openView(
   // L8: one column below 1480 px; the two-page spread starts there.
   view.renderer.setAttribute('max-column-count', (opts.width ?? 1280) >= 1480 ? '2' : '1')
   view.renderer.setStyles(readerCss(opts.fontPx ?? 19))
-  await view.init({ showTextStart: true })
+  await view.init({ lastLocation: opts.lastLocation, showTextStart: true })
   const t2 = await painted()
   return { view, openMs: t1 - t0, firstPageMs: t2 - t0 }
 }
