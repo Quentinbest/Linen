@@ -3,7 +3,7 @@
   "files": [
     {
       "name": "standardebooks-moby-dick.epub",
-      "url": "https://github.com/Quentinbest/read-book/releases/download/corpus-2026-08/standardebooks-moby-dick.epub",
+      "url": "https://github.com/Quentinbest/Linen/releases/download/corpus-2026-08/standardebooks-moby-dick.epub",
       "source": "Standard Ebooks (public domain), 2026-08-04 edition, kept on this repository's corpus-2026-08 release (#180)",
       "tags": [
         "epub3",
@@ -14,7 +14,7 @@
     },
     {
       "name": "gutenberg-2701-moby-dick-epub2.epub",
-      "url": "https://github.com/Quentinbest/read-book/releases/download/corpus-2026-08/gutenberg-2701-moby-dick-epub2.epub",
+      "url": "https://github.com/Quentinbest/Linen/releases/download/corpus-2026-08/gutenberg-2701-moby-dick-epub2.epub",
       "source": "Project Gutenberg (public domain), the file first pinned, kept on this repository's corpus-2026-08 release (#112)",
       "tags": [
         "epub2",
