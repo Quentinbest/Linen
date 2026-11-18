@@ -217,6 +217,87 @@ impl KitDevice {
     }
 }
 
+/// Past the real clock: the kit's changes are stamped with it (SY10 holds a version
+/// whose clock is ahead of the reader's).
+pub(crate) const READ: super::pass::Readings = super::pass::Readings {
+    mono_ms: 1_000,
+    wall_ms: 1_900_000_000_000,
+    clock_ahead: false,
+    same_boot: false,
+};
+
+impl KitDevice {
+    /// One whole pass of this device over its folder, with SY2's budgets.
+    pub(crate) fn pass(&mut self) -> super::pass::Report {
+        self.pass_with(&super::pass::Budgets::sy2())
+    }
+
+    pub(crate) fn pass_with(&mut self, budgets: &super::pass::Budgets) -> super::pass::Report {
+        use super::pass::{run, Device, State};
+        let state = State::load(self.db.conn(), &self.lib.id).unwrap();
+        let mut device = Device {
+            conn: self.db.conn(),
+            lib: self.lib,
+            store: &mut self.store,
+            ks: &self.ks,
+            state,
+            name: "Test Mac",
+        };
+        run(&mut device, &mut self.folder, READ, budgets, &|| 0).unwrap()
+    }
+
+    /// A pass over `folder` (this device's view, or one that wraps it), at `readings`.
+    pub(crate) fn pass_over<F: Folder>(
+        &mut self,
+        folder: &mut F,
+        readings: super::pass::Readings,
+        budgets: &super::pass::Budgets,
+        now: &dyn Fn() -> u64,
+    ) -> Result<super::pass::Report, super::pass::Error> {
+        use super::pass::{run, Device, State};
+        let state = State::load(self.db.conn(), &self.lib.id).unwrap();
+        let mut device = Device {
+            conn: self.db.conn(),
+            lib: self.lib,
+            store: &mut self.store,
+            ks: &self.ks,
+            state,
+            name: "Test Mac",
+        };
+        run(&mut device, folder, readings, budgets, now)
+    }
+}
+
+/// A folder that counts the directories it lists whose name starts with `watch`, for a
+/// clock that jumps once one has been listed.
+pub(crate) struct Watched<F: Folder> {
+    pub(crate) inner: F,
+    pub(crate) watch: &'static str,
+    pub(crate) listed: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl<F: Folder> Folder for Watched<F> {
+    type Token = F::Token;
+    fn list(&self, dir: &str, cursor: Option<&str>) -> std::io::Result<folder::Page<F::Token>> {
+        if dir.starts_with(self.watch) {
+            self.listed.set(self.listed.get() + 1);
+        }
+        self.inner.list(dir, cursor)
+    }
+    fn stat(&self, token: &F::Token) -> std::io::Result<Option<u64>> {
+        self.inner.stat(token)
+    }
+    fn read(&self, token: &F::Token, limit: Option<u64>) -> std::io::Result<folder::Read> {
+        self.inner.read(token, limit)
+    }
+    fn write(&mut self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.inner.write(path, bytes)
+    }
+    fn remove(&mut self, token: &F::Token) -> std::io::Result<()> {
+        self.inner.remove(token)
+    }
+}
+
 impl KitDevice {
     /// This device's own change files `1..=through`, read back from its folder.
     pub(crate) fn own_changes(&self, through: u64) -> Vec<super::chain::Change> {
@@ -314,6 +395,49 @@ impl KitDevice {
 }
 
 impl Kit {
+    /// SP19, SP20 (4): device `by` and the library's code remove device `gone` (and
+    /// whoever it enrolled), naming `cutoff` as the last change of it that stands, and
+    /// the removal is written to `trust/`. Returns the record's hash.
+    pub(crate) fn remove(
+        &mut self,
+        by: usize,
+        gone: usize,
+        cutoff: Option<(u64, Hash32)>,
+    ) -> Hash32 {
+        let prev = self.devices[0].store.library(&LIB).unwrap().rest["head"]
+            .as_str()
+            .and_then(Hash32::parse)
+            .unwrap();
+        let (current, next) = (Keypair::from_seed(&[99; 32]), Keypair::from_seed(&[98; 32]));
+        let signer = &self.devices[by].key;
+        let cutoff = cutoff.map_or(
+            serde_json::Value::Null,
+            |(s, h)| json!({"s": s, "h": h.to_string()}),
+        );
+        let (bytes, hash) = trust::sign(
+            "remove",
+            &LIB,
+            json!({
+                "prev": prev.to_string(), "clock": [NOW as u64, 2],
+                "removes": [{"device": self.devices[gone].lib.device.to_string(),
+                             "cutoff": cutoff, "view": null, "cascade": true}],
+                "code": {"nonce": b64url_encode(&[6; 16]), "codeKey": b64url_encode(&next.public())}
+            }),
+            &[
+                (signer, Signer::Device(signer.device()), 0),
+                (&current, Signer::Code, 0),
+                (&next, Signer::Code, 0),
+            ],
+        );
+        files::write_file(
+            &mut self.devices[by].folder,
+            &trust::trust_path(&hash),
+            &bytes,
+        )
+        .unwrap();
+        hash
+    }
+
     pub(crate) fn membership(&self, i: usize) -> membership::Membership {
         let device = &self.devices[i];
         let mut records = BTreeMap::new();

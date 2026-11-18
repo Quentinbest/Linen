@@ -17,6 +17,10 @@ pub struct Budgets {
     /// past the lowest floor checkpoint the run has to reach (the peer cache's
     /// 32 MB per peer, PROVISIONAL).
     pub run_bytes: u64,
+    /// SP26's cap on what is listed of a removed device's changes after its cutoff:
+    /// files and bytes of them. A value over SP26's (500, 64 MB) is cut to it.
+    pub tail_files: u64,
+    pub tail_bytes: u64,
 }
 
 impl Budgets {
@@ -27,6 +31,8 @@ impl Budgets {
             bytes: 256 * 1024 * 1024,
             elapsed_ms: 60_000,
             run_bytes: 32 << 20,
+            tail_files: super::late::MAX_LATE as u64,
+            tail_bytes: super::late::MAX_LATE_BYTES,
         }
     }
 }
@@ -300,6 +306,14 @@ pub struct Report {
     /// SP37 (4): peers still ahead of this device after the pass: a change file
     /// not in storage yet, a chain that waits, or one the pass left for a budget.
     pub behind: Vec<DeviceId>,
+    /// SP37 (3), SY34: identities membership doesn't hold whose device file or
+    /// `enroll/` request checked out. Nothing in them is believed or kept.
+    pub strangers: Vec<super::strangers::Stranger>,
+    /// SY34: unknown identities past the 32 a pass looks at, which it didn't read.
+    pub strangers_unread: u64,
+    /// SP37 (3), SP18, SP26: each removed device's change files after its cutoff,
+    /// listed and not applied, for the reader's Keep · Discard.
+    pub tails: Vec<super::tails::Tail>,
     pub stopped: Option<Stopped>,
     /// PS6: bytes written to storage; they count against `Budgets::bytes` with the
     /// bytes read.
@@ -508,7 +522,7 @@ fn steps<F: super::folder::Folder>(
     use super::device_file::{self, Accepted};
     use super::{membership, trust};
     let mut report = Report {
-        not_built: "SP37 step (3)'s unknown identities and removed devices' tails, steps (6)-(8) and (11); within step (5): the reader's Try again for a quarantined object (`choice:obj.`, SP12: nothing here writes a choice record or applies one's `clears` to the saved quarantines, so a quarantine has no exit) and the Settings › Sync line that shows quarantines (a peer's `quarantined` list is read by no one), and the repair of books (Stage 4); within step (4): the open reservations and holds and the marks (SP35) a view carries, and a view found by listing when the device file names none (PS1 lists no directories); within steps (9)-(10): the accepted-by-all marks (SP29, so a hold's naming change waits), peers' reservations and holds in the ledger, books, SY7's rotation when storage is ahead (SP27), the device file's own view (compaction is P3b), its views and proofs lists, and the hour's re-upload of own and cached files (SP15)",
+        not_built: "steps (6)-(8) and (11), so what step (4) receives is applied by `chain::receive_run` in its own transaction, with no store lock, SY26 guard or SY27 backup, and nothing marks a deletion's age (`ages.saw`); within step (3): reverting what this device applied of a removed device past its cutoff (#206, P3a), what to keep between passes of an unknown identity's request and of a removed device's tail (item 128: nothing is kept, so a tail is read again each pass), the 8-request cap and the day's removal of old requests (SY34: they are the enrolled device's `enroll/` sweep with answering and approving, which are SP24's), and the Keep · Discard of a tail (SP26: the late list and `choice` records, P3a); within step (5): the reader's Try again for a quarantined object (`choice:obj.`, SP12: nothing here writes a choice record or applies one's `clears` to the saved quarantines, so a quarantine has no exit) and the Settings › Sync line that shows quarantines (a peer's `quarantined` list is read by no one), and the repair of books (Stage 4); within step (4): the open reservations and holds and the marks (SP35) a view carries, and a view found by listing when the device file names none (PS1 lists no directories); within steps (9)-(10): the accepted-by-all marks (SP29, so a hold's naming change waits), peers' reservations and holds in the ledger, books, SY7's rotation when storage is ahead (SP27), the device file's own view (compaction is P3b), its views and proofs lists, and the hour's re-upload of own and cached files (SP15)",
         ..Report::default()
     };
     let mut meter = Meter {
@@ -824,6 +838,28 @@ fn steps<F: super::folder::Folder>(
         }
     }
     save_state(device)?;
+    // SP37 (3), SY34: the identities membership doesn't hold, then the removed
+    // devices' tails (SP18, SP26). Neither saves anything (PS5).
+    if report.stopped.is_none() {
+        super::strangers::read(
+            &device.lib.id,
+            folder,
+            &membership,
+            &entries,
+            &meter,
+            &mut report,
+        )?;
+    }
+    if report.stopped.is_none() {
+        super::tails::read(
+            &device.lib.id,
+            &device.lib.device,
+            folder,
+            &membership,
+            &meter,
+            &mut report,
+        )?;
+    }
     let mut blobs = None;
     if report.stopped.is_none() {
         receive_changes(
@@ -1370,6 +1406,10 @@ mod tests {
         };
 
         fn pass(kd: &mut KitDevice, budgets: &Budgets) -> (Report, State) {
+            pass_at(kd, READ, budgets)
+        }
+
+        fn pass_at(kd: &mut KitDevice, readings: Readings, budgets: &Budgets) -> (Report, State) {
             let state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
             let mut device = Device {
                 conn: kd.db.conn(),
@@ -1379,7 +1419,7 @@ mod tests {
                 state,
                 name: "Test Mac",
             };
-            let report = run(&mut device, &mut kd.folder, READ, budgets, &|| 0).unwrap();
+            let report = run(&mut device, &mut kd.folder, readings, budgets, &|| 0).unwrap();
             (report, device.state)
         }
 
@@ -1710,6 +1750,129 @@ mod tests {
             let (report, _) = pass(&mut kit.devices[0], &Budgets::sy2());
             assert_eq!(report.received, vec![(peer, 2)], "{report:?}");
             assert_eq!(note_of(&kit.devices[0].db, "book"), None);
+        }
+
+        #[test]
+        fn two_devices_exchange_a_note_and_a_deletion_through_run() {
+            // P2's first Done-when, #213. Every move is a whole `run`: a device
+            // publishes in steps (9)-(10), the other receives in step (4) and applies
+            // in the same call, as `chain::receive_run` does until step (6) takes
+            // that over under the lock (B3, #198): so no lock, no SY26 guard and no
+            // SY27 backup stand in this exchange. The kit's `publish_pending` isn't
+            // used.
+            let mut kit = testkit::library(2);
+            let ids: Vec<_> = kit.devices.iter().map(|d| d.lib.device).collect();
+            for (from, to) in [(0, 1), (1, 0)] {
+                let text = format!("note from {from}");
+                // A second note, not the first again: the first was deleted, and a
+                // version older than its deletion would lose to it (SP11).
+                let row = crate::store::AnnotationRow {
+                    id: format!("2b3c4d5e-6f7a-4b1c-9d2e-4f5a6b7c8d9{from}"),
+                    cfi_range: format!("epubcfi(/6/4!/4/{},/1:0,/1:4)", 2 + from),
+                    ..highlight("book", Some(&text), 1_760_000_001_000)
+                };
+                kit.devices[from].db.save_annotation(&row).unwrap();
+                let (sent, _) = pass(&mut kit.devices[from], &Budgets::sy2());
+                assert!(!sent.published.changes.is_empty(), "{sent:?}");
+                assert_eq!(note_of(&kit.devices[to].db, "book"), None);
+                let (got, _) = pass(&mut kit.devices[to], &Budgets::sy2());
+                assert_eq!(got.received.len(), 1, "{got:?}");
+                assert_eq!(got.received[0].0, ids[from]);
+                assert_eq!(note_of(&kit.devices[to].db, "book"), Some(Some(text)));
+                // The receiver deletes it; the sender, in its next pass, loses it too.
+                let id = kit.devices[to].db.annotations("book").unwrap()[0]
+                    .id
+                    .clone();
+                kit.devices[to].db.delete_annotation(&id).unwrap();
+                let (sent, _) = pass(&mut kit.devices[to], &Budgets::sy2());
+                assert!(!sent.published.changes.is_empty(), "{sent:?}");
+                assert!(note_of(&kit.devices[from].db, "book").is_some(), "not yet");
+                let (got, _) = pass(&mut kit.devices[from], &Budgets::sy2());
+                assert_eq!(got.received.len(), 1, "{got:?}");
+                assert_eq!(note_of(&kit.devices[from].db, "book"), None);
+                assert_eq!(note_of(&kit.devices[to].db, "book"), None);
+                // Quiet again: nothing is sent and nothing is received.
+                for kd in &mut kit.devices {
+                    let (quiet, _) = pass(kd, &Budgets::sy2());
+                    assert!(quiet.received.is_empty() && quiet.published.changes.is_empty());
+                }
+            }
+        }
+
+        #[test]
+        fn a_restart_between_whole_passes_keeps_a_deletions_age_and_a_witness_timeout() {
+            // P2's last Done-when, #213, SY17, SP32, SP35, PS5. The pass doesn't mark a
+            // deletion's age itself yet (that is step (6)'s apply), so the age is
+            // marked in the saved state between two passes; what is tested is that
+            // whole passes over restarts keep it and the witness timeout where they
+            // were. The first pass hears the peer's device file at vouched time 0.
+            let mut kit = testkit::library(2);
+            let peer = kit.devices[1].lib.device;
+            let (_, state) = pass(&mut kit.devices[0], &Budgets::sy2());
+            assert_eq!(state.heard.heard(&peer).map(|h| h.1), Some(0));
+            let gone = crate::sync::record::Entry {
+                device: peer,
+                seq: 1,
+                hash: Hash32([3; 32]),
+            };
+            let kd = &mut kit.devices[0];
+            let mut state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
+            state.ages.saw(gone, state.vouched.now());
+            super::save(&mut kd.db, &kd.lib.id, &state);
+            let wall = READ.wall_ms;
+            let at = |mono_ms, wall_ms, clock_ahead, same_boot| Readings {
+                mono_ms,
+                wall_ms,
+                clock_ahead,
+                same_boot,
+            };
+            // Each pass: its readings, whether the peer writes a new device file first,
+            // the deletion's age after it and the time since the peer was last heard.
+            let restarts = [
+                // The same boot, a minute later: the peer was last heard at 0.
+                (
+                    at(61_000, wall + 60_000, false, true),
+                    false,
+                    60_000,
+                    60_000,
+                ),
+                // The peer writes again, and is heard at the minute.
+                (at(61_000, wall + 60_000, false, true), true, 60_000, 0),
+                // After a reboot, the wall clock bridges the hour the device was off.
+                (
+                    at(5, wall + 3_660_000, false, false),
+                    false,
+                    3_660_000,
+                    3_600_000,
+                ),
+                // After a reboot with the clock marked ahead (SY10), nothing is bridged:
+                // both stay where they were, neither is reset.
+                (
+                    at(5, wall + 9_999_999_999, true, false),
+                    false,
+                    3_660_000,
+                    3_600_000,
+                ),
+            ];
+            for (readings, writes, age, timeout) in restarts {
+                if writes {
+                    kit.devices[1].publish_device_file();
+                }
+                let (_, state) = pass_at(&mut kit.devices[0], readings, &Budgets::sy2());
+                assert_eq!(state.ages.own_age(&gone, state.vouched.now()), Some(age));
+                let heard_at = state.heard.heard(&peer).unwrap().1;
+                assert_eq!(
+                    state.vouched.now() - heard_at,
+                    timeout,
+                    "the witness timeout"
+                );
+                // And what was saved says the same to a process that starts afresh.
+                let kd = &kit.devices[0];
+                let loaded = State::load(kd.db.conn(), &kd.lib.id).unwrap();
+                assert_eq!(loaded.vouched.now(), state.vouched.now());
+                assert_eq!(loaded.ages.own_age(&gone, loaded.vouched.now()), Some(age));
+                assert_eq!(loaded.heard.heard(&peer).map(|h| h.1), Some(heard_at));
+            }
         }
 
         #[test]
