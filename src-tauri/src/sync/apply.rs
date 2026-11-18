@@ -48,8 +48,9 @@ pub enum Received {
     /// SY28: this device has set aside as much from that one as it keeps, so it
     /// stops receiving from it; nothing of the change is kept.
     Stopped,
-    /// SY26: the reader is asked first; nothing of the change is kept until they
-    /// answer (`guard::answer`).
+    /// SY26: a question blocks further application. When this change crosses the
+    /// threshold, its safe prefix and receipt are durable; the rest waits for
+    /// the reader (`guard::answer`).
     Asks,
     /// SY26, SY27: sync is paused; nothing is received until the reader resumes.
     Paused,
@@ -95,7 +96,7 @@ fn aside_used(conn: &Connection, lib: &Library, device: DeviceId) -> Result<(i64
 
 /// SY28: what each device has set aside, read once per transaction and kept up to
 /// date as bodies are excluded, so excluding many costs one count, not one each.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Tally {
     used: std::collections::HashMap<DeviceId, (i64, i64)>,
     /// The devices a body was dropped from for want of room.
@@ -179,7 +180,7 @@ fn pending_used(conn: &Connection, lib: &Library, device: DeviceId) -> Result<i6
 pub fn receive_body(conn: &Connection, lib: &Library, bytes: &[u8]) -> Result<bool> {
     // SY26: while the reader is asked, or sync is paused, no body arrives to make
     // more ready; it is fetched again later.
-    if guard::asking(conn, lib)?.is_some() || guard::paused(conn, lib)? {
+    if guard::stalled(conn, lib)? {
         return Ok(false);
     }
     let hash = identity_hash(bytes);
@@ -701,7 +702,7 @@ fn receive_unit(
         return Ok(Received::Asks);
     }
     guard::prune(conn, lib, now_ms)?;
-    let tx = conn.unchecked_transaction()?;
+    let tx = journal::Unit::begin(conn)?;
     let mut sequences = std::collections::HashMap::new();
     if let Some(view) = view {
         // SP18, SP15: expose the spine to ancestry checks within the transaction;
@@ -930,13 +931,26 @@ fn receive_unit(
         approved_versions: guard::approved_versions(&tx, lib)?,
         ..Tally::default()
     };
+    let mut asked = false;
     for k in keys {
         // SY28: once a body of this device's has been dropped the change is rolled
         // back (below), so nothing more of it is worth applying.
         if budget.dropped.contains(&batch.device) {
             break;
         }
-        if apply_key(&tx, lib, &k, now_ms, &mut budget)? {
+        let one = journal::Unit::begin(&tx)?;
+        let mut trial = budget.clone();
+        let changed = apply_key(&one, lib, &k, now_ms, &mut trial)?;
+        if let Some((counts, totals)) = guard::over(&one, lib, now_ms)? {
+            let versions = trial.applied[budget.applied.len()..].to_vec();
+            drop(one);
+            guard::ask(&tx, lib, None, &versions, &counts, totals, now_ms)?;
+            asked = true;
+            break;
+        }
+        one.commit()?;
+        budget = trial;
+        if changed {
             applied += 1;
         }
     }
@@ -958,20 +972,7 @@ fn receive_unit(
     // isn't applied (it is rolled back) until the reader answers. What the reader
     // let through isn't counted, but what resolved with it is: past a threshold,
     // the reader is asked again.
-    if let Some((counts, totals)) = guard::over(&tx, lib, now_ms)? {
-        drop(tx);
-        guard::ask(
-            conn,
-            lib,
-            Some((batch.device, batch.seq, batch.hash)),
-            &budget.applied,
-            &counts,
-            totals,
-            now_ms,
-        )?;
-        return Ok(Received::Asks);
-    }
-    if gate == guard::Gate::Approved {
+    if gate == guard::Gate::Approved && !asked {
         guard::settle(&tx, lib)?;
     }
     // Another device whose waiting version was dropped here is stopped with it, and
@@ -983,6 +984,9 @@ fn receive_unit(
         stop_owners_past_budget(&tx, lib, h, Some(batch.device), now_ms)?;
     }
     tx.commit()?;
+    if asked {
+        return Ok(Received::Asks);
+    }
     Ok(Received::Applied {
         applied,
         set_aside: aside,
@@ -1155,16 +1159,12 @@ fn in_dependency_order(keys: &mut Vec<Key>) {
     keys.dedup_by(|a, b| a.as_str() == b.as_str());
 }
 
-/// Whether `apply_pending` could move something now with no new change arriving, so
-/// a caller (the pass, step 5) knows it is worth calling: a pending version (applied 0)
-/// whose body is held, or a version kept for this clock to catch up (-2) that the clock
-/// has now reached (SY10). A version waiting for its ancestry (-1) is rechecked when a
-/// change arrives, and one held for freshness (-7) is released by `freshness`, so
-/// neither is a reason to run it.
+/// Whether `apply_pending` might move something without a new change. Any pending
+/// version counts conservatively, including a tombstone or one awaiting a body;
+/// clock-ahead versions count once their clock can be rechecked (SY10).
 pub(crate) fn can_move(conn: &Connection, lib: &Library, now_ms: i64) -> Result<bool> {
     let held: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM sync_versions v
-            JOIN sync_bodies b ON b.hash = json_extract(v.raw, '$.body.hash')
             WHERE v.library = ?1 AND v.seq IS NOT NULL AND v.applied = 0)",
         [lib.id.to_string()],
         |r| r.get(0),
@@ -1206,7 +1206,7 @@ pub fn apply_pending(conn: &Connection, lib: &Library, now_ms: i64) -> Result<us
         keys.dedup_by(|a, b| a.as_str() == b.as_str());
         keys
     } else {
-        let tx = conn.unchecked_transaction()?;
+        let tx = journal::Unit::begin(conn)?;
         recheck_waiting(&tx, lib, now_ms)?;
         tx.commit()?;
         let keys: Vec<String> = conn
@@ -1218,7 +1218,7 @@ pub fn apply_pending(conn: &Connection, lib: &Library, now_ms: i64) -> Result<us
             .collect()
     };
     in_dependency_order(&mut keys);
-    let tx = conn.unchecked_transaction()?;
+    let tx = journal::Unit::begin(conn)?;
     let mut n = 0;
     // SY28: bodies excluded here are held to each device's budget as they are
     // excluded (`Tally`), so this needs no check of its own.
@@ -1226,8 +1226,21 @@ pub fn apply_pending(conn: &Connection, lib: &Library, now_ms: i64) -> Result<us
         approved_versions: approved,
         ..Tally::default()
     };
+    let mut asked = false;
     for key in keys {
-        if apply_key(&tx, lib, &key, now_ms, &mut aside)? {
+        let one = journal::Unit::begin(&tx)?;
+        let mut trial = aside.clone();
+        let changed = apply_key(&one, lib, &key, now_ms, &mut trial)?;
+        if let Some((counts, totals)) = guard::over(&one, lib, now_ms)? {
+            let versions = trial.applied[aside.applied.len()..].to_vec();
+            drop(one);
+            guard::ask(&tx, lib, None, &versions, &counts, totals, now_ms)?;
+            asked = true;
+            break;
+        }
+        one.commit()?;
+        aside = trial;
+        if changed {
             n += 1;
         }
     }
@@ -1237,12 +1250,7 @@ pub fn apply_pending(conn: &Connection, lib: &Library, now_ms: i64) -> Result<us
         stop(&tx, lib, *device, "set-aside budget", now_ms)?;
     }
     // SY26: as for a change received.
-    if let Some((counts, totals)) = guard::over(&tx, lib, now_ms)? {
-        drop(tx);
-        guard::ask(conn, lib, None, &aside.applied, &counts, totals, now_ms)?;
-        return Ok(0);
-    }
-    if gate == guard::Gate::Approved {
+    if gate == guard::Gate::Approved && !asked {
         guard::settle(&tx, lib)?;
     }
     tx.commit()?;
@@ -1841,6 +1849,15 @@ pub(crate) fn apply_key(
         Some(Outcome::Conflict { shown, all }) => (shown, all, false),
         None => return Ok(false),
     };
+    // SY26: a newer version of the same key may have become ready while the
+    // question was open. The approval covers only the version shown, so leave
+    // this key for the ordinary guard after settling the approval.
+    if guard::gate(conn, lib, None)? == guard::Gate::Approved
+        && winner.version.device != lib.device
+        && !aside.approved_versions.contains(&guard::version_id(winner))
+    {
+        return Ok(false);
+    }
     // SY26: what a remote version replaces is kept in the undo journal, and the
     // change counted, whenever a different version becomes the one shown. Read
     // before anything here changes (an unsent edit held, below).
@@ -4214,12 +4231,18 @@ pub(crate) mod tests {
         // SY26: 600 added is past 200, so the reader is asked first.
         let now = crate::store::now_ms();
         assert_eq!(receive(b.conn(), &lb, &batch, now).unwrap(), Received::Asks);
-        guard::answer(b.conn(), &lb, guard::Answer::Apply, now).unwrap();
-        assert!(matches!(
-            receive(b.conn(), &lb, &batch, now).unwrap(),
-            Received::Applied { .. }
-        ));
+        for turn in 0..20 {
+            let at = now + (turn + 1) * 10;
+            if guard::asking(b.conn(), &lb).unwrap().is_some() {
+                guard::answer(b.conn(), &lb, guard::Answer::Apply, at).unwrap();
+            }
+            let moved = apply_pending(b.conn(), &lb, at).unwrap();
+            if moved == 0 && guard::asking(b.conn(), &lb).unwrap().is_none() {
+                break;
+            }
+        }
         assert_eq!(b.annotations("book-b").unwrap().len(), 600);
+        assert_eq!(pending_used(b.conn(), &lb, la.device).unwrap(), 0);
     }
 
     #[test]

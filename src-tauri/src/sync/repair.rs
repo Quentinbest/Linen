@@ -413,9 +413,13 @@ pub(super) fn repair<F: Folder>(
     naming: &[u8; 32],
     now: i64,
 ) -> Result<(), Error> {
-    let (conn, lib) = (device.conn, device.lib);
+    let (db, lib) = (device.db, device.lib);
     // SY26: while the reader is asked or sync is paused nothing is read.
-    if guard::asking(conn, &lib)?.is_some() || guard::paused(conn, &lib)? {
+    let stalled = {
+        let conn = db.lock()?;
+        guard::asking(&conn, &lib)?.is_some() || guard::paused(&conn, &lib)?
+    };
+    if stalled {
         return Ok(());
     }
     device.state.objects.prune(now);
@@ -440,7 +444,11 @@ pub(super) fn repair<F: Folder>(
             && now.saturating_sub(r.at) >= RETRY_MS
             && !report.objects.refused.contains(name)
             && !o.is_quarantined(name)
-            && Hash32::parse(&r.hash).is_some_and(|h| journal::has_body(conn, &h).unwrap_or(false))
+            && Hash32::parse(&r.hash).is_some_and(|h| {
+                db.lock()
+                    .ok()
+                    .is_some_and(|conn| journal::has_body(&conn, &h).unwrap_or(false))
+            })
         {
             saved.push((name.clone(), r.hash.clone()));
         }
@@ -495,7 +503,8 @@ pub(super) fn repair<F: Folder>(
     // not yet in storage is written by step (9), after SP33's reservation, and not here.
     let publishing = publish::anything_to_publish(device)?;
     if let Some(listing) = blobs.as_ref().filter(|_| !publishing) {
-        let held: Vec<String> = conn
+        let held: Vec<String> = db
+            .lock()?
             .prepare(
                 "SELECT DISTINCT json_extract(v.raw, '$.body.hash') FROM sync_versions v
                  WHERE v.library = ?1 AND v.seq IS NOT NULL AND v.applied = 1
@@ -588,7 +597,7 @@ fn handle<F: Folder>(
     }
     // SY23: of which this device holds a validated copy; the copy is the body the
     // name stands for or nothing is written.
-    let copy = journal::body(device.conn, hash)?.filter(|b| identity_hash(b) == *hash);
+    let copy = journal::body(&*device.db.lock()?, hash)?.filter(|b| identity_hash(b) == *hash);
     // SP37 (5): a blob a live version names.
     let live = copy.is_some() && publish::live_named(device, hash)?;
     let Some(copy) = copy.filter(|_| live) else {
@@ -766,7 +775,8 @@ mod tests {
         let kd = &mut kit.devices[i];
         let state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
         let mut device = Device {
-            conn: kd.db.conn(),
+            db: crate::sync::pass::Database::Test(&kd.db),
+            root: kd.root.path(),
             lib: kd.lib,
             store: &mut kd.store,
             ks: &kd.ks,

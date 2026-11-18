@@ -72,7 +72,17 @@ pub fn list(root: &Path) -> Result<Vec<Backup>> {
         let manifest: Manifest = serde_json::from_str(&text)?;
         out.push(Backup { path, manifest });
     }
-    out.sort_by_key(|b| b.manifest.taken_at);
+    out.sort_by_key(|b| {
+        let suffix = b
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.rsplit_once('Z'))
+            .and_then(|(_, n)| n.strip_prefix('-'))
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        (b.manifest.taken_at, suffix)
+    });
     Ok(out)
 }
 
@@ -85,7 +95,14 @@ pub fn take(
     reason: &str,
     now_ms: i64,
 ) -> Result<Backup> {
-    let name = super::a9::iso_time(now_ms).replace(':', "-");
+    let base = super::a9::iso_time(now_ms).replace(':', "-");
+    // SY27: two backups can be needed at the same clock reading after a local edit.
+    let mut name = base.clone();
+    let mut suffix = 0_u64;
+    while root.join("Backups").join(&name).exists() {
+        suffix += 1;
+        name = format!("{base}-{suffix}");
+    }
     let done = root.join("Backups").join(&name);
     // Written under a temporary name and renamed when whole: an interrupted one is
     // never taken for a backup, and `prune` removes it.
@@ -146,10 +163,17 @@ pub fn covers(
     keys: &[Key],
     now_ms: i64,
 ) -> Result<bool> {
-    let Some(newest) = list(root)?.pop() else {
+    let Some(newest) = list(root)?
+        .into_iter()
+        .rev()
+        .find(|b| b.manifest.library == lib.id.to_string())
+    else {
         return Ok(false);
     };
-    if now_ms - newest.manifest.taken_at >= HOUR_MS {
+    // A clock moving backwards cannot establish that a backup is within an hour.
+    if now_ms < newest.manifest.taken_at
+        || now_ms.saturating_sub(newest.manifest.taken_at) >= HOUR_MS
+    {
         return Ok(false);
     }
     let copy = Connection::open_with_flags(
@@ -221,8 +245,12 @@ pub fn before_pass(
 
 /// The keys a change's versions delete (tombstones): what `before_pass` asks about.
 pub fn deletions(batch: &super::apply::Batch) -> Vec<Key> {
-    batch
-        .versions
+    deleted_keys(&batch.versions)
+}
+
+/// The keys these versions (a change's, or a view's records') delete.
+pub fn deleted_keys(versions: &[serde_json::Value]) -> Vec<Key> {
+    versions
         .iter()
         .filter(|v| v.get("deleted").is_some())
         .filter_map(|v| v["key"].as_str().and_then(Key::parse).map(|(k, _)| k))
@@ -300,6 +328,50 @@ mod tests {
     use crate::sync::ids::Id16;
 
     const HOUR: i64 = HOUR_MS;
+
+    #[test]
+    fn same_clock_reading_keeps_both_backups() {
+        let (dir, mut store, lib) = folder();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO books (id, content_hash, file_path, title, title_source, added_at)
+             VALUES ('book-b', 'h', 'moby.epub', 'Moby-Dick', 'package', 0)",
+                [],
+            )
+            .unwrap();
+        let first = take(store.conn(), dir.path(), &lib, "first sync", 10).unwrap();
+        store
+            .save_annotation(&highlight("book-b", Some("after"), 1_760_000_001_000))
+            .unwrap();
+        let key = Key::parse(&format!("note:{ANNO}")).unwrap().0;
+        assert!(!covers(
+            store.conn(),
+            dir.path(),
+            &lib,
+            std::slice::from_ref(&key),
+            10
+        )
+        .unwrap());
+        let second = take(store.conn(), dir.path(), &lib, "remote deletion", 10).unwrap();
+        assert_ne!(first.path, second.path);
+        assert_eq!(list(dir.path()).unwrap().len(), 2);
+        assert_eq!(list(dir.path()).unwrap().last().unwrap().path, second.path);
+        assert!(covers(store.conn(), dir.path(), &lib, &[key], 10).unwrap());
+    }
+
+    #[test]
+    fn coverage_requires_a_recent_backup_of_this_library() {
+        let (dir, store, lib) = folder();
+        take(store.conn(), dir.path(), &lib, "first sync", 10).unwrap();
+        let other = Library {
+            id: Id16([9; 16]),
+            ..lib
+        };
+        take(store.conn(), dir.path(), &other, "first sync", 100).unwrap();
+        assert!(!covers(store.conn(), dir.path(), &lib, &[], 5).unwrap());
+        assert!(!covers(store.conn(), dir.path(), &lib, &[], 10 + HOUR).unwrap());
+    }
 
     /// A library folder: its database on disk, and a book file.
     fn folder() -> (tempfile::TempDir, Store, Library) {

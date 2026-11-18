@@ -725,7 +725,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_view_lands_whole_or_not_at_all() {
+    fn a_view_keeps_its_pending_suffix_when_the_guard_asks() {
         let mut a = Device::new();
         for n in 0..101 {
             let mut h = highlight("book", Some("note"), 1_760_000_001_000);
@@ -742,29 +742,51 @@ pub(crate) mod tests {
             take(&c, &a, &v, &Floor::default(), &[]).unwrap().received,
             vec![Received::Asks]
         );
-        for table in [
-            "sync_versions",
-            "sync_changes",
-            "sync_spine_versions",
-            "sync_seen",
-            "sync_undo",
-        ] {
-            assert_eq!(count(&c, table), 0, "{table}");
-        }
-        assert!(c.db.annotations("book").unwrap().is_empty());
-        let identity: (i64, String) =
+        assert_eq!(held(&c, &a), v.through.s);
+        assert!(count(&c, "sync_spine_versions") > 0);
+        assert!(count(&c, "sync_undo") > 0);
+        let pending: i64 =
             c.db.conn()
-                .query_row("SELECT seq, hash FROM sync_question", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_versions WHERE applied = 0",
+                    [],
+                    |r| r.get(0),
+                )
                 .unwrap();
-        assert_eq!(identity, (v.through.s as i64, v.through.h.to_string()));
+        assert!(pending > 0, "the suffix is durably pending");
+        assert!(c
+            .db
+            .annotations("book")
+            .unwrap()
+            .iter()
+            .any(|row| row.note.is_none()));
         guard::answer(c.db.conn(), &c.lib, guard::Answer::Apply, now()).unwrap();
-        assert!(matches!(
-            take(&c, &a, &v, &Floor::default(), &[]).unwrap().received[0],
-            Received::Applied { .. }
-        ));
-        assert_eq!(c.db.annotations("book").unwrap().len(), 101);
+        assert!(crate::sync::apply::apply_pending(c.db.conn(), &c.lib, now() + 1).unwrap() > 0);
+        assert!(guard::asking(c.db.conn(), &c.lib).unwrap().is_none());
+        crate::sync::apply::apply_pending(c.db.conn(), &c.lib, now() + 1).unwrap();
+        let rows = c.db.annotations("book").unwrap();
+        assert_eq!(rows.len(), 101);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.note.as_deref() == Some("note"))
+                .count(),
+            100
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.note.as_deref() == Some("latest note"))
+                .count(),
+            1
+        );
+        let remaining: i64 =
+            c.db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_versions WHERE applied = 0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(remaining, 0);
         assert_eq!(held(&c, &a), v.through.s);
     }
 

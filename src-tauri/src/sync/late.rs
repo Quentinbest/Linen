@@ -285,7 +285,7 @@ pub fn revert_past(
             .unwrap_or(0);
         cutoffs.insert(device, cutoff);
     }
-    let tx = conn.unchecked_transaction()?;
+    let tx = journal::Unit::begin(conn)?;
     let mut result = Reverted::default();
     let mut affected = BTreeMap::<Key, Vec<Placed>>::new();
     let mut visited = HashSet::new();

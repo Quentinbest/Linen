@@ -19,11 +19,12 @@
 //!    aside, never kept, listed in the device file's `refused` and not read again
 //!    until `stat` shows another size or an hour has passed (`repair`). Then
 //!    `receive_body` keeps it, in its own transaction.
-//! 3. What was kept is applied (`apply_pending`), also when a budget stopped step 2:
-//!    a stop leaves no body kept but unapplied. If a crash comes between 2 and 3, the
-//!    body is held and its version still pending, and the next pass applies it,
-//!    because step 3 runs whenever `apply::can_move` says so: a pending version's body is held,
-//!    or a version kept for this clock to catch up (SY10) has been reached by it.
+//! 3. What was kept is applied by step (6) (`applying`, `apply_pending`), also when a
+//!    budget stopped step 2: a stop leaves no body kept but unapplied. If a crash
+//!    comes between 2 and 3, the body is held and its version still pending, and the
+//!    next pass applies it, because step (6) runs whenever `apply::can_move` says so:
+//!    a pending version's body is held, or a version kept for this clock to catch up
+//!    (SY10) has been reached by it.
 //!
 //! Nothing is applied before its body is held and has passed `apply`'s own check of it
 //! against its record type, and a version is applied once (`apply_key` marks it).
@@ -59,7 +60,9 @@ struct Want {
 /// past its type's limit is never fetched (SY28), nor one whose key this release
 /// can't read (SY9: it is never applied).
 fn wanted(device: &Device<'_>) -> Result<Vec<Want>, Error> {
-    let mut stmt = device.conn.prepare(
+    let db = device.db;
+    let conn = db.lock()?;
+    let mut stmt = conn.prepare(
         "SELECT v.key, json_extract(v.raw, '$.body.hash'), json_extract(v.raw, '$.body.size')
          FROM sync_versions v
          WHERE v.library = ?1 AND v.seq IS NOT NULL AND v.applied IN (0, -1, -2, -7)
@@ -95,9 +98,13 @@ fn wanted(device: &Device<'_>) -> Result<Vec<Want>, Error> {
     Ok(wants)
 }
 
+pub(super) fn waiting(device: &Device<'_>) -> Result<u64, Error> {
+    Ok(wanted(device)?.len() as u64)
+}
+
 /// SP37 (5): fetch the bodies received versions wait for that storage has now, and
-/// apply what that makes ready. A budget that runs out stops the pass after what was
-/// fetched is applied (SY2).
+/// keep them (`report.late.fetched`); step (6) applies what that makes ready. A budget
+/// that runs out stops the pass after what was fetched is applied (SY2).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fetch_waiting<F: Folder>(
     device: &mut Device<'_>,
@@ -106,12 +113,15 @@ pub(super) fn fetch_waiting<F: Folder>(
     report: &mut Report,
     blobs: &mut Option<BTreeMap<String, Listed<F::Token>>>,
     naming: &[u8; 32],
-    now_ms: i64,
 ) -> Result<(), Error> {
-    let (conn, lib) = (device.conn, device.lib);
+    let (db, lib) = (device.db, device.lib);
     // SY26, SY27: while the reader is asked or sync is paused no body is kept, so
     // none is read either; they are fetched after the answer.
-    if guard::asking(conn, &lib)?.is_some() || guard::paused(conn, &lib)? {
+    let stalled = {
+        let conn = db.lock()?;
+        guard::stalled(&conn, &lib)?
+    };
+    if stalled {
         return Ok(());
     }
     let wants = wanted(device)?;
@@ -138,16 +148,12 @@ pub(super) fn fetch_waiting<F: Folder>(
             pass::Body::Halt => break,
             pass::Body::Got(body) => body,
         };
-        if apply::receive_body(conn, &lib, &body)? {
+        if apply::receive_body(&*db.lock()?, &lib, &body)? {
             kept += 1;
         }
     }
     report.late.fetched = kept;
     report.late.waiting = wants.len() as u64 - kept;
-    // A stop doesn't leave a kept body unapplied.
-    if kept > 0 || apply::can_move(conn, &lib, now_ms)? {
-        report.late.applied = apply::apply_pending(conn, &lib, now_ms)?;
-    }
     Ok(())
 }
 
@@ -181,7 +187,8 @@ mod tests {
         let kd = &mut kit.devices[0];
         let state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
         let mut device = Device {
-            conn: kd.db.conn(),
+            db: crate::sync::pass::Database::Test(&kd.db),
+            root: kd.root.path(),
             lib: kd.lib,
             store: &mut kd.store,
             ks: &kd.ks,
@@ -555,6 +562,25 @@ mod tests {
 
     #[test]
     fn while_sync_is_paused_nothing_is_fetched() {
+        struct NoAccess;
+        impl Folder for NoAccess {
+            type Token = String;
+            fn list(&self, _: &str, _: Option<&str>) -> io::Result<Page<String>> {
+                panic!("paused pass listed storage")
+            }
+            fn stat(&self, _: &String) -> io::Result<Option<u64>> {
+                panic!("paused pass inspected storage")
+            }
+            fn read(&self, _: &String, _: Option<u64>) -> io::Result<folder::Read> {
+                panic!("paused pass read storage")
+            }
+            fn write(&mut self, _: &str, _: &[u8]) -> io::Result<()> {
+                panic!("paused pass wrote storage")
+            }
+            fn remove(&mut self, _: &String) -> io::Result<()> {
+                panic!("paused pass removed storage")
+            }
+        }
         // SY26, SY27: a paused library keeps no body, so none is read.
         let mut kit = testkit::library(2);
         let all = missing(&mut kit);
@@ -565,7 +591,8 @@ mod tests {
         let conn = kit.devices[0].db.conn();
         conn.execute("UPDATE sync_libraries SET state = 'paused'", [])
             .unwrap();
-        let report = pass(&mut kit);
+        let report = pass_with(&mut kit, READ, &mut NoAccess, &Budgets::sy2(), &|| 0).unwrap();
+        assert!(report.paused);
         assert_eq!(report.late, Late::default(), "{report:?}");
         for (name, _) in &all {
             assert_eq!(reads(&kit, name), 0);

@@ -20,6 +20,7 @@ pub(crate) const NAMING: [u8; 32] = [42; 32];
 // These fields are the kit's interface for later pass tests.
 #[allow(dead_code)]
 pub(crate) struct KitDevice {
+    pub(crate) root: tempfile::TempDir,
     pub(crate) db: Store,
     pub(crate) lib: Library,
     pub(crate) store: DeviceStore,
@@ -74,6 +75,7 @@ pub(crate) fn library(n: usize) -> Kit {
             .unwrap();
         let view = folder.view(&lib.device.to_string());
         devices.push(KitDevice {
+            root: tempfile::tempdir().unwrap(),
             db,
             lib,
             store,
@@ -236,7 +238,8 @@ impl KitDevice {
         use super::pass::{run, Device, State};
         let state = State::load(self.db.conn(), &self.lib.id).unwrap();
         let mut device = Device {
-            conn: self.db.conn(),
+            db: crate::sync::pass::Database::Test(&self.db),
+            root: self.root.path(),
             lib: self.lib,
             store: &mut self.store,
             ks: &self.ks,
@@ -257,7 +260,8 @@ impl KitDevice {
         use super::pass::{run, Device, State};
         let state = State::load(self.db.conn(), &self.lib.id).unwrap();
         let mut device = Device {
-            conn: self.db.conn(),
+            db: crate::sync::pass::Database::Test(&self.db),
+            root: self.root.path(),
             lib: self.lib,
             store: &mut self.store,
             ks: &self.ks,

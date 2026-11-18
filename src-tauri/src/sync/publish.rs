@@ -66,6 +66,10 @@ pub(super) fn publish<F: Folder>(
     devices: &[Listed<F::Token>],
 ) -> Result<(), Error> {
     let lib = device.lib;
+    if super::guard::paused(&*device.db.lock()?, &lib)? {
+        report.paused = true;
+        return Ok(());
+    }
     // This device's own device file as storage has it, once checked this pass.
     let mut checked = None;
     if anything_to_publish(device)? {
@@ -80,13 +84,20 @@ pub(super) fn publish<F: Folder>(
             &mut checked,
         )?;
         // Whatever stopped it, what is still waiting is said.
-        report.unsent = journal::unsent(device.conn, &lib)?.len() as u64;
+        report.unsent = journal::unsent(&*device.db.lock()?, &lib)?.len() as u64;
         if !go || report.stopped.is_some() {
             return Ok(());
         }
     }
+    super::pass::at(super::pass::Point::After(9), &*device.db.lock()?)?;
+    if super::guard::paused(&*device.db.lock()?, &lib)? {
+        report.paused = true;
+        return Ok(());
+    }
     // SP37 (10): after the changes are in storage, never before.
-    device_file_step(device, folder, meter, report, devices, checked)
+    device_file_step(device, folder, meter, report, devices, checked)?;
+    super::pass::at(super::pass::Point::After(10), &*device.db.lock()?)?;
+    Ok(())
 }
 
 /// A change signed and not yet in storage, one numbered and never signed, or a
@@ -94,9 +105,10 @@ pub(super) fn publish<F: Folder>(
 pub(super) fn anything_to_publish(device: &Device<'_>) -> Result<bool, Error> {
     let lib = device.lib;
     let last = device.store.library(&lib.id).ok_or(Error::NoIdentity)?.seq;
+    let conn = device.db.lock()?;
     Ok(!chain::pending(device.store, &lib.id)?.is_empty()
-        || journal::numbered_unsigned(device.conn, &lib, last)?
-        || !journal::unsent(device.conn, &lib)?.is_empty())
+        || journal::numbered_unsigned(&conn, &lib, last)?
+        || !journal::unsent(&conn, &lib)?.is_empty())
 }
 
 /// `false` when publication can't go on this pass: storage is ahead of this device,
@@ -122,7 +134,8 @@ fn publish_waiting<F: Folder>(
     {
         let marks =
             frontier::stored_marks(device.store.library(&lib.id).ok_or(Error::NoIdentity)?)?;
-        let held = |d: &DeviceId, s: u64| held_of(device.conn, &lib, d, s);
+        let db = device.db;
+        let held = |d: &DeviceId, s: u64| held_of(&*db.lock().ok()?, &lib, d, s);
         let (none, mine) = (BTreeSet::new(), BTreeSet::from([lib.device]));
         let progress = Progress {
             accepted: &marks,
@@ -379,7 +392,7 @@ fn send<F: Folder>(
         if is_there(blobs, written, &object) {
             continue;
         }
-        let body = journal::body(device.conn, &hash)?.filter(|b| identity_hash(b) == hash);
+        let body = journal::body(&*device.db.lock()?, &hash)?.filter(|b| identity_hash(b) == hash);
         let Some(body) = body else {
             // Nothing to write; a peer waits for the body (SY28).
             report
@@ -433,8 +446,8 @@ struct Item {
 /// SP33: whether some live version names the body: a head of a record that
 /// carries it. A deleted record's body, or one an edit replaced, is not live.
 pub(super) fn live_named(device: &Device<'_>, hash: &Hash32) -> Result<bool, Error> {
-    let keys: Vec<String> = device
-        .conn
+    let conn = device.db.lock()?;
+    let keys: Vec<String> = conn
         .prepare(
             "SELECT DISTINCT key FROM sync_versions
              WHERE library = ?1 AND seq IS NOT NULL AND applied = 1
@@ -452,7 +465,7 @@ pub(super) fn live_named(device: &Device<'_>, hash: &Hash32) -> Result<bool, Err
         let Some((key, _)) = Key::parse(&key) else {
             continue;
         };
-        let record = journal::record_of(device.conn, &device.lib, &key, journal::Which::Applied)?;
+        let record = journal::record_of(&conn, &device.lib, &key, journal::Which::Applied)?;
         if record
             .heads(&HashSet::new())
             .iter()
@@ -468,7 +481,8 @@ pub(super) fn live_named(device: &Device<'_>, hash: &Hash32) -> Result<bool, Err
 /// live or not: content it has named before.
 fn known(device: &Device<'_>, hash: &Hash32) -> Result<bool, Error> {
     Ok(device
-        .conn
+        .db
+        .lock()?
         .query_row(
             "SELECT 1 FROM sync_versions WHERE library = ?1 AND seq IS NOT NULL
              AND json_extract(raw, '$.body.hash') = ?2 LIMIT 1",
@@ -514,7 +528,8 @@ fn plan(
             .library(&device.lib.id)
             .ok_or(Error::NoIdentity)?,
     )?;
-    let held = |d: &DeviceId, s: u64| held_of(device.conn, &device.lib, d, s);
+    let db = device.db;
+    let held = |d: &DeviceId, s: u64| held_of(&*db.lock().ok()?, &device.lib, d, s);
     let (none, mine) = (BTreeSet::new(), BTreeSet::from([me]));
     let progress = Progress {
         accepted: &marks,
@@ -528,7 +543,8 @@ fn plan(
     let reserved: BTreeSet<Hash32> = ledger.open_reservations(me).map(|(_, r)| r.name).collect();
     let holds: Vec<_> = ledger.open_holds(me).collect();
     let mut out = Vec::new();
-    for version in journal::unsent(device.conn, &device.lib)? {
+    let unsent = journal::unsent(&*device.db.lock()?, &device.lib)?;
+    for version in unsent {
         let (class, blob) = match &version.content {
             // Books arrive in Stage 4: a `bookFile` version, with its book, waits.
             _ if version.kind == Kind::BookFile => (Class::Waiting, None),
@@ -676,7 +692,7 @@ fn rounds<F: Folder>(
             .map(|i| i.version.key.clone())
             .collect();
         let signed = chain::publish_with(
-            device.conn,
+            &*device.db.lock()?,
             &lib,
             device.ks,
             device.store,
@@ -709,7 +725,7 @@ fn rounds<F: Folder>(
             if !seen.insert(blob.name.clone()) {
                 continue;
             }
-            let Some(body) = journal::body(device.conn, &blob.hash)? else {
+            let Some(body) = journal::body(&*device.db.lock()?, &blob.hash)? else {
                 report.set_aside.push((
                     format!("blobs/{}", blob.name),
                     "its body is not kept here".into(),
@@ -738,8 +754,9 @@ fn rounds<F: Folder>(
             .filter(|i| i.class != Class::Ready)
             .map(|i| i.version.key.clone())
             .collect();
-        if let Some(signed) = chain::publish_with(
-            device.conn,
+        let db = device.db;
+        let signed = chain::publish_with(
+            &*db.lock()?,
             &lib,
             device.ks,
             device.store,
@@ -747,7 +764,8 @@ fn rounds<F: Folder>(
             &[],
             &device.state.ledger,
             &withheld,
-        )? {
+        )?;
+        if let Some(signed) = signed {
             if !send(
                 device,
                 folder,
@@ -853,6 +871,30 @@ fn says_the_same(a: &Fields, b: &Fields) -> bool {
     strip(a) == strip(b)
 }
 
+/// SP16: receipt is not application. A frontier can cover a peer's sequence
+/// only when every kept version through it has applied, been superseded, or
+/// been permanently refused for an invalid body. Missing bodies, unresolved
+/// ancestry, future clocks, freshness holds, and late changes remain outstanding.
+fn applied_through(
+    conn: &rusqlite::Connection,
+    lib: &journal::Library,
+    peer: &DeviceId,
+    seq: u64,
+) -> Result<bool, Error> {
+    if super::apply::stopped(conn, lib, *peer)? {
+        // SY28 can drop pending rows when it stops a peer, so their absence
+        // cannot prove that the change was applied.
+        return Ok(false);
+    }
+    let pending: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sync_versions WHERE library = ?1 AND device = ?2
+         AND seq IS NOT NULL AND seq <= ?3 AND applied NOT IN (1, 2, -4))",
+        rusqlite::params![lib.id.to_string(), peer.to_string(), seq as i64],
+        |r| r.get(0),
+    )?;
+    Ok(!pending)
+}
+
 /// SP16: what this device's device file says now, from the pass's state.
 fn device_fields(device: &mut Device<'_>, report: &Report) -> Result<Fields, Error> {
     use super::ids::b64url_decode;
@@ -868,7 +910,7 @@ fn device_fields(device: &mut Device<'_>, report: &Report) -> Result<Fields, Err
         .and_then(|v| v.as_str())
         .and_then(Hash32::parse);
     let marks = frontier::stored_marks(state)?;
-    let (ms, n) = journal::clock_of(device.conn, &lib)?;
+    let (ms, n) = journal::clock_of(&*device.db.lock()?, &lib)?;
     // SP16: for every other device whose changes it has applied, the latest, with
     // that device's own signature. A signature saved before the change was applied
     // vouches for nothing until it has been.
@@ -877,21 +919,23 @@ fn device_fields(device: &mut Device<'_>, report: &Report) -> Result<Fields, Err
         if *peer == me {
             continue;
         }
-        let seen = super::apply::seen(device.conn, &lib, *peer)?;
-        let held = chain::held_hash(device.conn, &lib, peer, seen)?;
+        let db = device.db;
+        let conn = db.lock()?;
+        let seen = super::apply::seen(&conn, &lib, *peer)?;
+        let held = chain::held_hash(&conn, &lib, peer, seen)?;
         let Some(sigs) = device.state.sigs.peers.get_mut(peer) else {
             continue;
         };
         if let Some(c) = sigs.candidate.clone() {
-            if c.s == seen && Some(c.h) == held {
+            if c.s == seen && Some(c.h) == held && applied_through(&conn, &lib, peer, c.s)? {
                 sigs.confirmed = Some(c);
                 sigs.candidate = None;
             }
         }
         // It may vouch for less than it has applied, never for more.
         if let Some(c) = &sigs.confirmed {
-            let still = chain::held_hash(device.conn, &lib, peer, c.s)?;
-            if c.s <= seen && still == Some(c.h) {
+            let still = chain::held_hash(&conn, &lib, peer, c.s)?;
+            if c.s <= seen && still == Some(c.h) && applied_through(&conn, &lib, peer, c.s)? {
                 if let Some(sig) = b64url_decode(&c.sig).and_then(|b| b.try_into().ok()) {
                     applied.insert(*peer, (Mark { s: c.s, h: c.h }, sig));
                 }
@@ -1023,7 +1067,8 @@ mod tests {
     ) -> Result<pass::Report, pass::Error> {
         let state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
         let mut device = pass::Device {
-            conn: kd.db.conn(),
+            db: crate::sync::pass::Database::Test(&kd.db),
+            root: kd.root.path(),
             lib: kd.lib,
             store: &mut kd.store,
             ks: &kd.ks,
@@ -1711,6 +1756,129 @@ mod tests {
         let file = device_file_of(&kit, b);
         assert!(file.fields.lists["frontier"].is_empty(), "{file:?}");
         assert_eq!(db, file.device);
+    }
+
+    #[test]
+    fn a_guarded_change_is_not_in_the_frontier_until_its_suffix_applies() {
+        use crate::sync::guard::{self, Answer};
+        let mut kit = testkit::library(2);
+        let peer = kit.devices[1].lib.device;
+        let mut ids = Vec::new();
+        for n in 0..30 {
+            let mut row = highlight("book", Some("note"), 1_760_000_001_000);
+            row.id = format!("{n:08x}-6f7a-4b1c-9d2e-4f5a6b7c8d9e");
+            kit.devices[1].db.save_annotation(&row).unwrap();
+            ids.push(row.id);
+        }
+        assert_eq!(kit.devices[1].publish_pending(), Some(1));
+        go(&mut kit, 0);
+        let frontier_of = |kit: &Kit| {
+            let file = device_file_of(kit, 0);
+            frontier::entries(&file.fields.lists["frontier"], true)
+                .into_iter()
+                .find(|e| e.d == peer)
+                .map(|e| e.s)
+        };
+        assert_eq!(frontier_of(&kit), Some(1));
+        for id in &ids {
+            kit.devices[1].db.delete_annotation(id).unwrap();
+        }
+        assert_eq!(kit.devices[1].publish_pending(), Some(2));
+        let asked = go(&mut kit, 0);
+        assert!(asked.asking.is_some(), "{asked:?}");
+        let receiver = &kit.devices[0];
+        assert_eq!(
+            crate::sync::apply::seen(receiver.db.conn(), &receiver.lib, peer).unwrap(),
+            2,
+            "receipt is durable"
+        );
+        guard::answer(
+            receiver.db.conn(),
+            &receiver.lib,
+            Answer::Apply,
+            READ.wall_ms as i64 + 1,
+        )
+        .unwrap();
+        let resumed = go(&mut kit, 0);
+        assert!(resumed.asking.is_none(), "{resumed:?}");
+        let receiver = &kit.devices[0];
+        let pending: i64 = receiver.db.conn().query_row(
+            "SELECT COUNT(*) FROM sync_versions WHERE library = ?1 AND device = ?2 AND seq = 2 AND applied = 0",
+            rusqlite::params![receiver.lib.id.to_string(), peer.to_string()], |r| r.get(0),
+        ).unwrap();
+        assert!(pending > 0, "the rest of the change is still pending");
+        assert_eq!(
+            frontier_of(&kit),
+            Some(1),
+            "the earlier applied frontier remains"
+        );
+        go(&mut kit, 0);
+        let receiver = &kit.devices[0];
+        assert_eq!(receiver.db.conn().query_row(
+            "SELECT COUNT(*) FROM sync_versions WHERE library = ?1 AND device = ?2 AND seq = 2 AND applied = 0",
+            rusqlite::params![receiver.lib.id.to_string(), peer.to_string()], |r| r.get::<_, i64>(0),
+        ).unwrap(), 0);
+        assert_eq!(frontier_of(&kit), Some(2));
+    }
+
+    #[test]
+    fn a_previously_confirmed_frontier_is_withheld_if_its_records_are_pending() {
+        let mut kit = testkit::library(2);
+        let peer = kit.devices[1].lib.device;
+        with_note(&mut kit.devices[1]);
+        go(&mut kit, 1);
+        go(&mut kit, 0);
+        let kd = &mut kit.devices[0];
+        let state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
+        let confirmed = state.sigs.peers[&peer].confirmed.clone().unwrap();
+        let key: String = kd.db.conn().query_row(
+            "SELECT key FROM sync_versions WHERE library = ?1 AND device = ?2 AND seq = ?3 LIMIT 1",
+            rusqlite::params![kd.lib.id.to_string(), peer.to_string(), confirmed.s as i64], |r| r.get(0),
+        ).unwrap();
+        let mut device = pass::Device {
+            db: pass::Database::Test(&kd.db),
+            root: kd.root.path(),
+            lib: kd.lib,
+            store: &mut kd.store,
+            ks: &kd.ks,
+            state,
+            name: "Test Mac",
+        };
+        let report = Report {
+            trusted: vec![peer],
+            ..Report::default()
+        };
+        for status in [0, -1, -2, -5, -6, -7] {
+            let conn = device.db.lock().unwrap();
+            conn.execute("UPDATE sync_versions SET applied = ?1 WHERE library = ?2 AND device = ?3 AND seq = ?4 AND key = ?5",
+                rusqlite::params![status, kd.lib.id.to_string(), peer.to_string(), confirmed.s as i64, key]).unwrap();
+            drop(conn);
+            let fields = device_fields(&mut device, &report).unwrap();
+            assert!(
+                frontier::entries(&fields.lists["frontier"], true).is_empty(),
+                "status {status}"
+            );
+        }
+        for status in [-4, 1, 2] {
+            let conn = device.db.lock().unwrap();
+            conn.execute("UPDATE sync_versions SET applied = ?1 WHERE library = ?2 AND device = ?3 AND seq = ?4 AND key = ?5",
+                rusqlite::params![status, kd.lib.id.to_string(), peer.to_string(), confirmed.s as i64, key]).unwrap();
+            drop(conn);
+            let fields = device_fields(&mut device, &report).unwrap();
+            let entries = frontier::entries(&fields.lists["frontier"], true);
+            assert_eq!(entries.len(), 1, "status {status}");
+            assert_eq!(entries[0].s, confirmed.s);
+        }
+        {
+            let conn = device.db.lock().unwrap();
+            super::super::apply::stop(&conn, &device.lib, peer, "budget", READ.wall_ms as i64)
+                .unwrap();
+        }
+        let fields = device_fields(&mut device, &report).unwrap();
+        assert!(
+            frontier::entries(&fields.lists["frontier"], true).is_empty(),
+            "a stopped peer may have dropped pending rows"
+        );
     }
 
     #[test]

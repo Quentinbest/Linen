@@ -2,7 +2,7 @@
 use super::ids::{DeviceId, Hash32, Id16};
 use super::trust::Mark;
 use super::{ages, freshness, hold, retention, weeks};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -156,6 +156,8 @@ impl Default for State {
 }
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("the library store lock was poisoned")]
+    StoreLock,
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -178,6 +180,10 @@ pub enum Error {
     Chain(#[from] super::chain::ChainError),
     #[error(transparent)]
     Hold(#[from] hold::HoldError),
+    #[error(transparent)]
+    Backup(#[from] super::backup::BackupError),
+    #[error(transparent)]
+    Late(#[from] super::late::LateError),
 }
 fn read<T: DeserializeOwned + Default>(
     conn: &Connection,
@@ -194,12 +200,7 @@ fn read<T: DeserializeOwned + Default>(
     json.map(|s| serde_json::from_str(&s).map_err(Error::from))
         .unwrap_or_else(|| Ok(T::default()))
 }
-fn write<T: Serialize>(
-    tx: &Transaction<'_>,
-    lib: &Id16,
-    name: &str,
-    value: &T,
-) -> Result<(), Error> {
+fn write<T: Serialize>(tx: &Connection, lib: &Id16, name: &str, value: &T) -> Result<(), Error> {
     tx.execute("INSERT INTO sync_pass_state (library, name, json) VALUES (?1, ?2, ?3) ON CONFLICT(library, name) DO UPDATE SET json = excluded.json", params![lib.to_string(), name, serde_json::to_string(value)?])?;
     Ok(())
 }
@@ -229,7 +230,7 @@ impl State {
             objects: read(conn, lib, "objects")?,
         })
     }
-    pub fn save(&self, tx: &Transaction<'_>, lib: &Id16) -> Result<(), Error> {
+    pub fn save(&self, tx: &Connection, lib: &Id16) -> Result<(), Error> {
         write(tx, lib, "ledger", &self.ledger)?;
         write(tx, lib, "weeks", &self.weeks)?;
         write(tx, lib, "heard", &self.heard)?;
@@ -265,13 +266,53 @@ pub struct Readings {
 
 /// What one device holds for a pass (PS4).
 pub struct Device<'a> {
-    pub conn: &'a Connection,
+    pub db: Database<'a>,
+    /// SY27: the library folder, where `Backups/` is kept.
+    pub root: &'a std::path::Path,
     pub lib: super::journal::Library,
     pub store: &'a mut super::device_store::DeviceStore,
     pub ks: &'a dyn super::device_store::Keystore,
     pub state: State,
     /// SP16, SY7: the platform's name for this device (cut to 64 characters).
     pub name: &'a str,
+}
+
+/// The application's store mutex is the authority for all access to its connection.
+#[derive(Clone, Copy)]
+pub enum Database<'a> {
+    Store(&'a std::sync::Mutex<crate::store::Store>),
+    #[cfg(test)]
+    Test(&'a crate::store::Store),
+}
+
+pub enum DatabaseGuard<'a> {
+    Store(std::sync::MutexGuard<'a, crate::store::Store>),
+    #[cfg(test)]
+    Test(&'a crate::store::Store),
+}
+
+impl std::ops::Deref for DatabaseGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Store(store) => store.conn(),
+            #[cfg(test)]
+            Self::Test(store) => store.conn(),
+        }
+    }
+}
+
+impl Database<'_> {
+    pub fn lock(&self) -> Result<DatabaseGuard<'_>, Error> {
+        match self {
+            Self::Store(store) => store
+                .lock()
+                .map(DatabaseGuard::Store)
+                .map_err(|_| Error::StoreLock),
+            #[cfg(test)]
+            Self::Test(store) => Ok(DatabaseGuard::Test(store)),
+        }
+    }
 }
 
 /// PS6: which budget stopped a pass.
@@ -326,6 +367,14 @@ pub struct Report {
     /// SP15 (1): why this device published nothing, when it found storage that
     /// it can't write beside.
     pub blocked: Option<Blocked>,
+    /// SP37 (6), SY26: the reader's question, when one is open after the pass: what
+    /// was counted. Nothing more is applied until it is answered.
+    pub asking: Option<super::guard::Counts>,
+    /// SY26, SY27: sync is paused (Stop syncing, or a restored backup), so nothing
+    /// is received or applied.
+    pub paused: bool,
+    /// SP37 (6), SY27: why the pass took a backup under the lock, if it did.
+    pub backup: Option<String>,
     /// PS4: steps not built yet are named, never silently skipped.
     pub not_built: &'static str,
 }
@@ -477,13 +526,56 @@ fn code_enrollments_below(
 }
 
 pub(super) fn save_state(device: &Device<'_>) -> Result<(), Error> {
-    let tx = device.conn.unchecked_transaction()?;
+    let db = device.db;
+    let conn = db.lock()?;
+    save_state_in(device, &conn)
+}
+
+pub(super) fn save_state_in(device: &Device<'_>, conn: &Connection) -> Result<(), Error> {
+    let tx = super::journal::Unit::begin(conn)?;
     device.state.save(&tx, &device.lib.id)?;
     tx.commit()?;
     Ok(())
 }
 
-/// SP37 (1)–(4) and (9)–(10), PS4–PS7: one pass. It reads membership before any
+/// PS5, C30: the places between two steps of a pass, and inside step 6, where a test
+/// may stop it, as a kill would, to see what the next pass makes of what was committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Point {
+    /// The end of step `n`, after what it changed is saved.
+    After(u8),
+    /// Step 6: the store's write lock is taken.
+    Locked,
+    /// Step 6: the backup is taken, under the lock.
+    BackedUp,
+    /// Step 6: everything is applied and saved, and the lock's transaction is open.
+    Applied,
+    /// Step 6: the transaction has committed and the lock is released.
+    Committed,
+}
+
+#[cfg(test)]
+type Hook = Box<dyn FnMut(Point, &Connection) -> Result<(), Error>>;
+#[cfg(test)]
+thread_local! {
+    pub(super) static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A test's stop between two steps; nothing in a build that isn't a test.
+#[cfg(test)]
+pub(super) fn at(point: Point, conn: &Connection) -> Result<(), Error> {
+    HOOK.with(|h| match h.borrow_mut().as_mut() {
+        Some(hook) => hook(point, conn),
+        None => Ok(()),
+    })
+}
+#[cfg(not(test))]
+#[inline(always)]
+pub(super) fn at(_: Point, _: &Connection) -> Result<(), Error> {
+    Ok(())
+}
+
+/// SP37 (1)–(6) and (9)–(10), PS4–PS7: one pass. It reads membership before any
 /// device file (#122's crowding risk), saves `State` after each step that changed
 /// it (PS5), and stops where a budget runs out (PS6). What isn't built yet is named
 /// in the report's `not_built`.
@@ -494,6 +586,12 @@ pub fn run<F: super::folder::Folder>(
     budgets: &Budgets,
     now: &dyn Fn() -> u64,
 ) -> Result<Report, Error> {
+    if super::guard::paused(&*device.db.lock()?, &device.lib)? {
+        return Ok(Report {
+            paused: true,
+            ..Report::default()
+        });
+    }
     let mut report = steps(device, folder, readings, budgets, now)?;
     // SP37 (4): the peers still ahead, whichever way the steps ended.
     for &peer in &report.trusted {
@@ -505,7 +603,7 @@ pub fn run<F: super::folder::Folder>(
             .library(&device.lib.id)
             .and_then(|l| l.floors.get(&peer.to_string()))
             .map_or(0, |f| f.s);
-        if super::apply::seen(device.conn, &device.lib, peer)? < target {
+        if super::apply::seen(&*device.db.lock()?, &device.lib, peer)? < target {
             report.behind.push(peer);
         }
     }
@@ -522,7 +620,7 @@ fn steps<F: super::folder::Folder>(
     use super::device_file::{self, Accepted};
     use super::{membership, trust};
     let mut report = Report {
-        not_built: "steps (6)-(8) and (11), so what step (4) receives is applied by `chain::receive_run` in its own transaction, with no store lock, SY26 guard or SY27 backup, and nothing marks a deletion's age (`ages.saw`); within step (3): reverting what this device applied of a removed device past its cutoff (#206, P3a), what to keep between passes of an unknown identity's request and of a removed device's tail (item 128: nothing is kept, so a tail is read again each pass), the 8-request cap and the day's removal of old requests (SY34: they are the enrolled device's `enroll/` sweep with answering and approving, which are SP24's), and the Keep · Discard of a tail (SP26: the late list and `choice` records, P3a); within step (5): the reader's Try again for a quarantined object (`choice:obj.`, SP12: nothing here writes a choice record or applies one's `clears` to the saved quarantines, so a quarantine has no exit) and the Settings › Sync line that shows quarantines (a peer's `quarantined` list is read by no one), and the repair of books (Stage 4); within step (4): the open reservations and holds and the marks (SP35) a view carries, and a view found by listing when the device file names none (PS1 lists no directories); within steps (9)-(10): the accepted-by-all marks (SP29, so a hold's naming change waits), peers' reservations and holds in the ledger, books, SY7's rotation when storage is ahead (SP27), the device file's own view (compaction is P3b), its views and proofs lists, and the hour's re-upload of own and cached files (SP15)",
+        not_built: "steps (7), (8) and (11); within step (3): what to keep between passes of an unknown identity's request and of a removed device's tail (item 128: nothing is kept, so a tail is read again each pass), the 8-request cap and the day's removal of old requests (SY34: they are the enrolled device's `enroll/` sweep with answering and approving, which are SP24's), and the reader’s Keep · Discard of a tail (SP26: later pass and UI work); within step (5): the reader's Try again for a quarantined object (`choice:obj.`, SP12: nothing here writes a choice record or applies one's `clears` to the saved quarantines, so a quarantine has no exit) and the Settings › Sync line that shows quarantines (a peer's `quarantined` list is read by no one), and the repair of books (Stage 4); within step (4): the open reservations and holds and the marks (SP35) a view carries, and a view found by listing when the device file names none (PS1 lists no directories); within steps (9)-(10): the accepted-by-all marks (SP29, so a hold's naming change waits), peers' reservations and holds in the ledger, books, SY7's rotation when storage is ahead (SP27), the device file's own view (compaction is P3b), its views and proofs lists, and the hour's re-upload of own and cached files (SP15)",
         ..Report::default()
     };
     let mut meter = Meter {
@@ -565,6 +663,7 @@ fn steps<F: super::folder::Folder>(
     // SP9: bodies are named with the naming key, which the device store keeps.
     let naming = naming_key(library)?;
     save_state(device)?;
+    at(Point::After(1), &*device.db.lock()?)?;
 
     // (2) SP37, SP20, SP21: libraries/ and trust/, then membership.
     if list_all(folder, "libraries", &meter, &mut report)?.is_none() {
@@ -700,6 +799,7 @@ fn steps<F: super::folder::Folder>(
         *device.store = next;
     }
     save_state(device)?;
+    at(Point::After(2), &*device.db.lock()?)?;
 
     // (3) SP37, SP16, SP18: each trusted peer's device file, at most 32.
     let Some(entries) = list_all(folder, "devices", &meter, &mut report)? else {
@@ -860,7 +960,9 @@ fn steps<F: super::folder::Folder>(
             &mut report,
         )?;
     }
+    at(Point::After(3), &*device.db.lock()?)?;
     let mut blobs = None;
+    let mut runs = Vec::new();
     if report.stopped.is_none() {
         receive_changes(
             device,
@@ -868,23 +970,16 @@ fn steps<F: super::folder::Folder>(
             &membership,
             &naming,
             &named_views,
-            readings.wall_ms as i64,
             &meter,
             &mut report,
             &mut blobs,
+            &mut runs,
         )?;
     }
+    at(Point::After(4), &*device.db.lock()?)?;
     // SP37 (5): the bodies received versions waited for, once storage has them.
     if report.stopped.is_none() {
-        super::bodies::fetch_waiting(
-            device,
-            folder,
-            &meter,
-            &mut report,
-            &mut blobs,
-            &naming,
-            readings.wall_ms as i64,
-        )?;
+        super::bodies::fetch_waiting(device, folder, &meter, &mut report, &mut blobs, &naming)?;
     }
     // SP37 (5), SY23: blobs a live version names that storage lost or damaged.
     if report.stopped.is_none() {
@@ -900,8 +995,21 @@ fn steps<F: super::folder::Folder>(
         )?;
     }
     save_state(device)?;
+    at(Point::After(5), &*device.db.lock()?)?;
+    // SP37 (6): small things first, under the store's lock. A budget that ran out in
+    // (4) or (5) stops the pass after what step 6 has applied (SY2).
+    super::applying::apply_all(
+        device,
+        &mut report,
+        &naming,
+        runs,
+        &membership,
+        readings.wall_ms as i64,
+    )?;
+    report.late.waiting = super::bodies::waiting(device)?;
+    at(Point::After(6), &*device.db.lock()?)?;
     // SP37 (9): a budget that ran out earlier stops the pass where it is.
-    if report.stopped.is_none() {
+    if report.stopped.is_none() && !report.paused && report.asking.is_none() {
         super::publish::publish(
             device,
             folder,
@@ -943,9 +1051,12 @@ pub(super) fn body_over_limit(version: &serde_json::Value) -> bool {
 
 /// SP37 (4), SP18, PS6: for each trusted peer whose accepted device file names a
 /// change this device doesn't hold: its view when it is needed (`views`), then its
-/// change files in order, each with the blobs its versions name that storage has
-/// now (a body not there yet waits for step 5). `chain::receive_run` checks the run
-/// against the peer's floor and applies it, after the view when there is one.
+/// change files in order, each opened and checked, with the blobs its versions name
+/// that storage has now (a body not there yet waits for step 5). What it reads is
+/// kept in `runs`, and step (6) (`applying`) applies it under the store's lock:
+/// `chain::receive_run` checks each run against the peer's floor there, after the
+/// view when there is one. While sync is paused or the reader is asked, nothing is
+/// read: nothing would be applied (SY26).
 #[allow(clippy::too_many_arguments)]
 fn receive_changes<F: super::folder::Folder>(
     device: &mut Device<'_>,
@@ -953,10 +1064,10 @@ fn receive_changes<F: super::folder::Folder>(
     membership: &super::membership::Membership,
     naming: &[u8; 32],
     named_views: &BTreeMap<DeviceId, Hash32>,
-    now_ms: i64,
     meter: &Meter<'_>,
     report: &mut Report,
     blobs: &mut Option<BTreeMap<String, super::folder::Listed<F::Token>>>,
+    runs: &mut Vec<super::applying::Run>,
 ) -> Result<(), Error> {
     use super::{apply, chain, device_file, views};
     // PS5: a removed device's note of a view isn't kept.
@@ -964,6 +1075,11 @@ fn receive_changes<F: super::folder::Folder>(
     device.state.views.peers.retain(|d, _| trusted.contains(d));
     // PS5: a view an earlier pass was landing is finished first, ahead or not.
     if views::finish_landings(device, folder, meter, report, membership, naming)? {
+        return Ok(());
+    }
+    // SY26, SY27: a pause or an open question stops what is applied, so what would be
+    // read is left in storage, which holds it.
+    if super::guard::stalled(&*device.db.lock()?, &device.lib)? {
         return Ok(());
     }
     for peer in trusted {
@@ -978,13 +1094,13 @@ fn receive_changes<F: super::folder::Folder>(
         else {
             continue;
         };
-        let have = apply::seen(device.conn, &device.lib, peer)?;
+        let have = apply::seen(&*device.db.lock()?, &device.lib, peer)?;
         let Some(key) = membership.key(&peer).filter(|_| have < target) else {
             continue;
         };
         // SY28: a peer this device has stopped receiving from costs the pass
         // nothing; it stays in `behind`.
-        if apply::stopped(device.conn, &device.lib, peer)? {
+        if apply::stopped(&*device.db.lock()?, &device.lib, peer)? {
             continue;
         }
         let floor = device_file::floor_of(device.store, &device.lib.id, &peer)?;
@@ -1026,18 +1142,15 @@ fn receive_changes<F: super::folder::Folder>(
         };
         let Some(listing) = listing else {
             if let Some(opened) = taken.filter(|o| o.view.through.s >= lowest) {
-                keep_candidate(device, &peer, spine_mark(&opened))?;
-                views::receive(
-                    device,
-                    report,
-                    naming,
-                    &peer,
-                    &key,
-                    opened,
-                    Vec::new(),
-                    now_ms,
-                )?;
-                settle(device, report, peer, have)?;
+                runs.push(super::applying::Run {
+                    peer,
+                    key,
+                    have,
+                    floor,
+                    last_sig: spine_mark(&opened),
+                    taken: Some(opened),
+                    files: Vec::new(),
+                });
             }
             return Ok(());
         };
@@ -1111,20 +1224,19 @@ fn receive_changes<F: super::folder::Folder>(
         if last_sig.is_none() {
             last_sig = taken.as_ref().and_then(spine_mark);
         }
-        // SP16: the signature of the last change of the run is kept before the run is
-        // applied, so a crash after it leaves the frontier entry to be made.
-        keep_candidate(device, &peer, last_sig)?;
-        if let Some(opened) = taken {
-            views::receive(device, report, naming, &peer, &key, opened, files, now_ms)?;
-        } else if !files.is_empty() {
-            match chain::receive_run(device.conn, &device.lib, &peer, &key, &floor, files, now_ms) {
-                Ok(_) => {}
-                Err(e) => report
-                    .set_aside
-                    .push((format!("changes/{peer}"), format!("{e}"))),
-            }
+        // SP37 (4), (6): what was read waits for step 6, which keeps the signature of
+        // the run's last change before it applies the run (SP16).
+        if taken.is_some() || !files.is_empty() {
+            runs.push(super::applying::Run {
+                peer,
+                key,
+                have,
+                floor,
+                last_sig,
+                taken,
+                files,
+            });
         }
-        settle(device, report, peer, have)?;
         if halted {
             return Ok(());
         }
@@ -1141,29 +1253,15 @@ fn spine_mark(opened: &super::views::Opened) -> Option<SignedMark> {
     })
 }
 
-/// SP16: the signature of the last change of what is about to be applied, kept
-/// before the apply so a crash after it leaves the frontier entry to be made.
-fn keep_candidate(
-    device: &mut Device<'_>,
-    peer: &DeviceId,
-    mark: Option<SignedMark>,
-) -> Result<(), Error> {
-    if let Some(mark) = mark {
-        device.state.sigs.peers.entry(*peer).or_default().candidate = Some(mark);
-        save_state(device)?;
-    }
-    Ok(())
-}
-
-/// SP37 (4): what a peer's receive came to: the report, and the floor's checkpoints
+/// SP37 (4), (6): what a peer's receive came to: the report, and the floor's checkpoints
 /// that no later change need be kept for.
-fn settle(
+pub(super) fn settle(
     device: &mut Device<'_>,
     report: &mut Report,
     peer: DeviceId,
     have: u64,
 ) -> Result<(), Error> {
-    let now_held = super::apply::seen(device.conn, &device.lib, peer)?;
+    let now_held = super::apply::seen(&*device.db.lock()?, &device.lib, peer)?;
     if now_held > have {
         report.received.push((peer, now_held));
         super::device_file::prune_floors(device.ks, device.store, &device.lib.id, &peer, now_held)?;
@@ -1409,10 +1507,620 @@ mod tests {
             pass_at(kd, READ, budgets)
         }
 
+        #[test]
+        fn store_mutex_covers_backup_and_apply_but_not_folder_io() {
+            use crate::sync::folder::{self, Page, Read};
+            use std::sync::{Arc, Mutex};
+            struct Checked {
+                inner: folder::View,
+                db: Arc<Mutex<crate::store::Store>>,
+            }
+            impl Folder for Checked {
+                type Token = <folder::View as Folder>::Token;
+                fn list(
+                    &self,
+                    dir: &str,
+                    cursor: Option<&str>,
+                ) -> std::io::Result<Page<Self::Token>> {
+                    assert!(self.db.try_lock().is_ok(), "lock held during list");
+                    self.inner.list(dir, cursor)
+                }
+                fn stat(&self, token: &Self::Token) -> std::io::Result<Option<u64>> {
+                    assert!(self.db.try_lock().is_ok(), "lock held during stat");
+                    self.inner.stat(token)
+                }
+                fn read(&self, token: &Self::Token, limit: Option<u64>) -> std::io::Result<Read> {
+                    assert!(self.db.try_lock().is_ok(), "lock held during read");
+                    self.inner.read(token, limit)
+                }
+                fn write(&mut self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+                    assert!(self.db.try_lock().is_ok(), "lock held during write");
+                    self.inner.write(path, bytes)
+                }
+                fn remove(&mut self, token: &Self::Token) -> std::io::Result<()> {
+                    assert!(self.db.try_lock().is_ok(), "lock held during remove");
+                    self.inner.remove(token)
+                }
+            }
+            let mut kit = testkit::library(2);
+            kit.devices[1]
+                .db
+                .save_annotation(&highlight("book", Some("remote"), 1_760_000_001_000))
+                .unwrap();
+            kit.devices[1].publish_pending();
+            let inner = kit.folder.view(&kit.devices[0].lib.device.to_string());
+            let kd = &mut kit.devices[0];
+            kd.db
+                .save_annotation(&highlight("book", Some("local"), 1_760_000_002_000))
+                .unwrap();
+            let db = Arc::new(Mutex::new(std::mem::replace(
+                &mut kd.db,
+                crate::store::Store::open_in_memory().unwrap(),
+            )));
+            let state = State::load(db.lock().unwrap().conn(), &kd.lib.id).unwrap();
+            let locked = Arc::clone(&db);
+            let points = Arc::new(Mutex::new(Vec::new()));
+            let observed = Arc::clone(&points);
+            HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |point, _| {
+                    if matches!(point, Point::BackedUp | Point::Applied) {
+                        assert!(locked.try_lock().is_err());
+                        observed.lock().unwrap().push(point);
+                    }
+                    Ok(())
+                }))
+            });
+            let mut device = Device {
+                db: Database::Store(&db),
+                root: kd.root.path(),
+                lib: kd.lib,
+                store: &mut kd.store,
+                ks: &kd.ks,
+                state,
+                name: "Test Mac",
+            };
+            let mut folder = Checked {
+                inner,
+                db: Arc::clone(&db),
+            };
+            let result = run(&mut device, &mut folder, READ, &Budgets::sy2(), &|| 0);
+            HOOK.with(|hook| *hook.borrow_mut() = None);
+            let report = result.unwrap();
+            assert!(!report.received.is_empty());
+            assert_eq!(
+                *points.lock().unwrap(),
+                vec![Point::BackedUp, Point::Applied]
+            );
+        }
+
+        #[test]
+        fn failure_before_step_six_commit_restores_database_and_state() {
+            let mut kit = testkit::library(2);
+            kit.devices[1]
+                .db
+                .save_annotation(&highlight("book", Some("remote"), 1_760_000_001_000))
+                .unwrap();
+            kit.devices[1].publish_pending();
+            let peer = kit.devices[1].lib.device;
+            let kd = &mut kit.devices[0];
+            let state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
+            let mut device = Device {
+                db: Database::Test(&kd.db),
+                root: kd.root.path(),
+                lib: kd.lib,
+                store: &mut kd.store,
+                ks: &kd.ks,
+                state,
+                name: "Test Mac",
+            };
+            HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|point, _| {
+                    if point == Point::Applied {
+                        return Err(Error::Folder(std::io::Error::other(
+                            "injected before commit",
+                        )));
+                    }
+                    Ok(())
+                }))
+            });
+            let failed = run(&mut device, &mut kd.folder, READ, &Budgets::sy2(), &|| 0);
+            HOOK.with(|hook| *hook.borrow_mut() = None);
+            assert!(failed.is_err());
+            assert!(kd.db.annotations("book").unwrap().is_empty());
+            assert_eq!(
+                crate::sync::apply::seen(kd.db.conn(), &kd.lib, peer).unwrap(),
+                0
+            );
+            let saved = State::load(kd.db.conn(), &kd.lib.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(&saved.views).unwrap(),
+                serde_json::to_value(&device.state.views).unwrap()
+            );
+            let report = run(&mut device, &mut kd.folder, READ, &Budgets::sy2(), &|| 0).unwrap();
+            assert_eq!(report.received.len(), 1);
+            assert_eq!(kd.db.annotations("book").unwrap().len(), 1);
+        }
+
+        #[test]
+        fn pausing_during_folder_read_stops_apply_revert_and_publish() {
+            use crate::sync::folder::{self, Page, Read};
+            use std::sync::{
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+                Arc, Mutex,
+            };
+            struct Pausing {
+                inner: folder::View,
+                db: Arc<Mutex<crate::store::Store>>,
+                paused: AtomicBool,
+                writes: AtomicUsize,
+            }
+            impl Folder for Pausing {
+                type Token = <folder::View as Folder>::Token;
+                fn list(
+                    &self,
+                    dir: &str,
+                    cursor: Option<&str>,
+                ) -> std::io::Result<Page<Self::Token>> {
+                    self.inner.list(dir, cursor)
+                }
+                fn stat(&self, token: &Self::Token) -> std::io::Result<Option<u64>> {
+                    self.inner.stat(token)
+                }
+                fn read(&self, token: &Self::Token, limit: Option<u64>) -> std::io::Result<Read> {
+                    let result = self.inner.read(token, limit)?;
+                    if !self.paused.swap(true, Ordering::SeqCst) {
+                        self.db
+                            .lock()
+                            .unwrap()
+                            .conn()
+                            .execute("UPDATE sync_libraries SET state = 'paused'", [])
+                            .unwrap();
+                    }
+                    Ok(result)
+                }
+                fn write(&mut self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+                    self.writes.fetch_add(1, Ordering::SeqCst);
+                    self.inner.write(path, bytes)
+                }
+                fn remove(&mut self, token: &Self::Token) -> std::io::Result<()> {
+                    self.writes.fetch_add(1, Ordering::SeqCst);
+                    self.inner.remove(token)
+                }
+            }
+            let mut kit = testkit::library(3);
+            kit.devices[1]
+                .db
+                .save_annotation(&highlight(
+                    "book",
+                    Some("already applied"),
+                    1_760_000_001_000,
+                ))
+                .unwrap();
+            kit.devices[1].publish_pending();
+            pass(&mut kit.devices[0], &Budgets::sy2());
+            let peer = kit.devices[1].lib.device;
+            let mut new = highlight("book", Some("must wait"), 1_760_000_002_000);
+            new.id = "2b3c4d5e-6f7a-4b1c-9d2e-4f5a6b7c8d9e".into();
+            kit.devices[2].db.save_annotation(&new).unwrap();
+            kit.devices[2].publish_pending();
+            let inner = kit.folder.view(&kit.devices[0].lib.device.to_string());
+            let kd = &mut kit.devices[0];
+            let mut state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
+            state.membership.quarantined.insert(peer, None);
+            save_raw(kd, &state);
+            let db = Arc::new(Mutex::new(std::mem::replace(
+                &mut kd.db,
+                crate::store::Store::open_in_memory().unwrap(),
+            )));
+            let mut folder = Pausing {
+                inner,
+                db: Arc::clone(&db),
+                paused: AtomicBool::new(false),
+                writes: AtomicUsize::new(0),
+            };
+            let mut device = Device {
+                db: Database::Store(&db),
+                root: kd.root.path(),
+                lib: kd.lib,
+                store: &mut kd.store,
+                ks: &kd.ks,
+                state,
+                name: "Test Mac",
+            };
+            let report = run(&mut device, &mut folder, READ, &Budgets::sy2(), &|| 0).unwrap();
+            assert!(report.paused);
+            assert!(folder.paused.load(Ordering::SeqCst));
+            assert_eq!(folder.writes.load(Ordering::SeqCst), 0);
+            let db = db.lock().unwrap();
+            let rows = db.annotations("book").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].note.as_deref(), Some("already applied"));
+            let late: i64 = db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM sync_late", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(late, 0, "the quarantine did not revert during the pause");
+        }
+
+        #[test]
+        fn pausing_after_apply_stops_publication() {
+            let mut kit = testkit::library(2);
+            let kd = &mut kit.devices[0];
+            kd.db
+                .save_annotation(&highlight("book", Some("local"), 1_760_000_001_000))
+                .unwrap();
+            HOOK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(|point, conn| {
+                    if point == Point::After(6) {
+                        conn.execute("UPDATE sync_libraries SET state = 'paused'", [])?;
+                    }
+                    Ok(())
+                }))
+            });
+            let (report, _) = pass(kd, &Budgets::sy2());
+            HOOK.with(|h| *h.borrow_mut() = None);
+            assert!(report.paused);
+            assert!(report.published.changes.is_empty());
+            assert_eq!(kd.store.library(&kd.lib.id).unwrap().seq, 0);
+            assert!(!crate::sync::journal::unsent(kd.db.conn(), &kd.lib)
+                .unwrap()
+                .is_empty());
+        }
+
+        #[test]
+        fn approved_pending_key_does_not_approve_a_newer_peer_version() {
+            use crate::sync::{
+                apply::{self, Batch},
+                files::{self, Read},
+                guard,
+            };
+            let mut kit = testkit::library(3);
+            let mut batches = Vec::new();
+            for i in 1..=2 {
+                let kd = &mut kit.devices[i];
+                let text = if i == 1 { "approved" } else { "newer" };
+                kd.db
+                    .save_annotation(&highlight("book", Some(text), 1_760_000_001_000 + i as i64))
+                    .unwrap();
+                kd.publish_pending().unwrap();
+                let path = crate::sync::chain::change_path(&kd.lib.device, 1);
+                let entry = kd
+                    .folder
+                    .list(&format!("changes/{}", kd.lib.device), None)
+                    .unwrap()
+                    .entries
+                    .into_iter()
+                    .find(|e| e.name == path)
+                    .unwrap();
+                let Read::Bytes(bytes) = files::read_file(&kd.folder, &entry).unwrap() else {
+                    panic!("change unavailable")
+                };
+                let change = crate::sync::chain::open_change(
+                    &bytes,
+                    &kd.lib.id,
+                    &kd.lib.device,
+                    &kd.key.public(),
+                )
+                .unwrap();
+                let mut batch = Batch {
+                    device: kd.lib.device,
+                    seq: 1,
+                    hash: change.hash,
+                    versions: change.versions,
+                    bodies: vec![],
+                };
+                for version in &mut batch.versions {
+                    version["clock"] =
+                        serde_json::json!([READ.wall_ms - (3 - i as u64) * 1_000, 0]);
+                }
+                batches.push(batch);
+            }
+            let kd = &kit.devices[0];
+            for batch in &batches {
+                apply::receive(kd.db.conn(), &kd.lib, batch, READ.wall_ms as i64).unwrap();
+            }
+            let key = batches[0]
+                .versions
+                .iter()
+                .find_map(|v| v["key"].as_str().filter(|k| k.starts_with("annotation:")))
+                .unwrap();
+            let approved = (batches[0].device.to_string(), 1, key.to_string());
+            guard::ask(
+                kd.db.conn(),
+                &kd.lib,
+                None,
+                &[approved],
+                &guard::Counts::default(),
+                false,
+                READ.wall_ms as i64,
+            )
+            .unwrap();
+            let (paused, _) = pass(&mut kit.devices[0], &Budgets::sy2());
+            assert!(paused.asking.is_some());
+            assert!(kit.devices[0].db.annotations("book").unwrap().is_empty());
+            let kd = &kit.devices[0];
+            guard::answer(
+                kd.db.conn(),
+                &kd.lib,
+                guard::Answer::Apply,
+                READ.wall_ms as i64 + 1,
+            )
+            .unwrap();
+            pass_at(
+                &mut kit.devices[0],
+                Readings {
+                    wall_ms: READ.wall_ms + 2,
+                    ..READ
+                },
+                &Budgets::sy2(),
+            );
+            assert!(
+                kit.devices[0].db.annotations("book").unwrap().is_empty(),
+                "the unapproved newer winner must wait"
+            );
+            pass_at(
+                &mut kit.devices[0],
+                Readings {
+                    wall_ms: READ.wall_ms + 3,
+                    ..READ
+                },
+                &Budgets::sy2(),
+            );
+            let rows = kit.devices[0].db.annotations("book").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].note.as_deref(), Some("newer"));
+            let counted: i64 = kit.devices[0]
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_counted WHERE approved = 0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(counted > 0, "the newer version is counted normally");
+        }
+
+        #[test]
+        fn process_kill_between_steps_and_inside_apply_recovers() {
+            use crate::sync::device_store::{Keystore, StoreError};
+            use crate::sync::files::{self, Read};
+            use serde::{Deserialize, Serialize};
+            use std::path::PathBuf;
+
+            #[derive(Serialize, Deserialize)]
+            struct Fixture {
+                library: String,
+                device: String,
+                files: Vec<(String, Vec<u8>)>,
+            }
+            struct FileKeys(PathBuf);
+            impl Keystore for FileKeys {
+                fn load(&self) -> Result<Option<Vec<u8>>, StoreError> {
+                    std::fs::read(&self.0)
+                        .map(Some)
+                        .map_err(|_| StoreError::Unreadable)
+                }
+                fn save(&self, bytes: &[u8]) -> Result<(), StoreError> {
+                    std::fs::write(&self.0, bytes).map_err(|_| StoreError::Unreadable)
+                }
+            }
+            struct DiskFolder(PathBuf);
+            impl DiskFolder {
+                fn load(&self) -> std::io::Result<BTreeMap<String, Vec<u8>>> {
+                    serde_json::from_slice(&std::fs::read(&self.0)?).map_err(std::io::Error::other)
+                }
+                fn save(&self, map: &BTreeMap<String, Vec<u8>>) -> std::io::Result<()> {
+                    std::fs::write(
+                        &self.0,
+                        serde_json::to_vec(map).map_err(std::io::Error::other)?,
+                    )
+                }
+            }
+            impl Folder for DiskFolder {
+                type Token = String;
+                fn list(
+                    &self,
+                    dir: &str,
+                    _: Option<&str>,
+                ) -> std::io::Result<crate::sync::folder::Page<String>> {
+                    let prefix = format!("{dir}/");
+                    let entries = self
+                        .load()?
+                        .into_keys()
+                        .filter(|path| {
+                            path.strip_prefix(&prefix)
+                                .is_some_and(|rest| !rest.contains('/'))
+                        })
+                        .map(|name| crate::sync::folder::Listed {
+                            token: name.clone(),
+                            name,
+                            ours: true,
+                        })
+                        .collect();
+                    Ok(crate::sync::folder::Page {
+                        entries,
+                        next: None,
+                    })
+                }
+                fn stat(&self, token: &String) -> std::io::Result<Option<u64>> {
+                    Ok(self.load()?.get(token).map(|b| b.len() as u64))
+                }
+                fn read(
+                    &self,
+                    token: &String,
+                    limit: Option<u64>,
+                ) -> std::io::Result<crate::sync::folder::Read> {
+                    Ok(match self.load()?.remove(token) {
+                        Some(bytes) if limit.is_some_and(|n| bytes.len() as u64 > n) => {
+                            crate::sync::folder::Read::TooLarge
+                        }
+                        Some(bytes) => crate::sync::folder::Read::Bytes(bytes),
+                        None => crate::sync::folder::Read::Gone,
+                    })
+                }
+                fn write(&mut self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+                    let mut map = self.load()?;
+                    map.insert(path.to_string(), bytes.to_vec());
+                    self.save(&map)
+                }
+                fn remove(&mut self, token: &String) -> std::io::Result<()> {
+                    let mut map = self.load()?;
+                    map.remove(token);
+                    self.save(&map)
+                }
+            }
+            if let Ok(dir) = std::env::var("LINEN_B3_KILL_FIXTURE") {
+                let root = PathBuf::from(dir);
+                let input: Fixture =
+                    serde_json::from_slice(&std::fs::read(root.join("input.json")).unwrap())
+                        .unwrap();
+                let lib = crate::sync::journal::Library {
+                    id: Id16::parse(&input.library).unwrap(),
+                    device: DeviceId::parse(&input.device).unwrap(),
+                };
+                let db = std::sync::Mutex::new(
+                    crate::store::Store::open(&root.join("library.db")).unwrap(),
+                );
+                let ks = FileKeys(root.join("keys"));
+                let mut store = crate::sync::device_store::DeviceStore::load(&ks).unwrap();
+                let state = State::load(db.lock().unwrap().conn(), &lib.id).unwrap();
+                let mut folder = DiskFolder(root.join("folder.json"));
+                if let Ok(target) = std::env::var("LINEN_B3_KILL_POINT") {
+                    HOOK.with(|h| {
+                        *h.borrow_mut() = Some(Box::new(move |point, _| {
+                            if format!("{point:?}") == target {
+                                // A real process death leaves SQLite and the key store as they stand.
+                                unsafe {
+                                    libc::kill(libc::getpid(), libc::SIGKILL);
+                                }
+                            }
+                            Ok(())
+                        }))
+                    });
+                }
+                let mut device = Device {
+                    db: Database::Store(&db),
+                    root: &root,
+                    lib,
+                    store: &mut store,
+                    ks: &ks,
+                    state,
+                    name: "Test Mac",
+                };
+                run(&mut device, &mut folder, READ, &Budgets::sy2(), &|| 0).unwrap();
+                let quiet = run(&mut device, &mut folder, READ, &Budgets::sy2(), &|| 0).unwrap();
+                assert!(quiet.received.is_empty());
+                let rows = db.lock().unwrap().annotations("book").unwrap();
+                assert_eq!(rows.len(), 2);
+                assert!(rows
+                    .iter()
+                    .any(|row| row.note.as_deref() == Some("survives")));
+                assert!(rows
+                    .iter()
+                    .any(|row| row.note.as_deref() == Some("local survives")));
+                assert!(device.store.library(&lib.id).unwrap().seq > 0);
+                return;
+            }
+            let mut kit = testkit::library(2);
+            kit.devices[1]
+                .db
+                .save_annotation(&highlight("book", Some("survives"), 1_760_000_001_000))
+                .unwrap();
+            kit.devices[1].publish_pending();
+            let mut local = highlight("book", Some("local survives"), 1_760_000_002_000);
+            local.id = "2b3c4d5e-6f7a-4b1c-9d2e-4f5a6b7c8d9e".into();
+            kit.devices[0].db.save_annotation(&local).unwrap();
+            let kd = &kit.devices[0];
+            let peer = kit.devices[1].lib.device;
+            let dirs = [
+                "libraries".to_string(),
+                "trust".to_string(),
+                "devices".to_string(),
+                "blobs".to_string(),
+                format!("changes/{peer}"),
+            ];
+            let mut files = Vec::new();
+            for dir in dirs {
+                for entry in kd.folder.list(&dir, None).unwrap().entries {
+                    if let Read::Bytes(bytes) = files::read_file(&kd.folder, &entry).unwrap() {
+                        files.push((entry.name, bytes));
+                    }
+                }
+            }
+            let input = Fixture {
+                library: kd.lib.id.to_string(),
+                device: kd.lib.device.to_string(),
+                files,
+            };
+            let executable = std::env::current_exe().unwrap();
+            for point in [
+                "After(1)",
+                "After(2)",
+                "After(3)",
+                "After(4)",
+                "After(5)",
+                "Locked",
+                "BackedUp",
+                "Applied",
+                "Committed",
+                "After(6)",
+                "After(9)",
+                "After(10)",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                kd.db
+                    .conn()
+                    .backup(
+                        rusqlite::MAIN_DB,
+                        dir.path().join("library.db"),
+                        rusqlite::backup::NO_PROGRESS,
+                    )
+                    .unwrap();
+                std::fs::write(dir.path().join("keys"), kd.ks.load().unwrap().unwrap()).unwrap();
+                std::fs::write(
+                    dir.path().join("input.json"),
+                    serde_json::to_vec(&input).unwrap(),
+                )
+                .unwrap();
+                let initial: BTreeMap<_, _> = input.files.iter().cloned().collect();
+                std::fs::write(
+                    dir.path().join("folder.json"),
+                    serde_json::to_vec(&initial).unwrap(),
+                )
+                .unwrap();
+                let child = |kill: bool| {
+                    let mut cmd = std::process::Command::new(&executable);
+                    cmd.arg("--exact").arg("sync::pass::tests::run::process_kill_between_steps_and_inside_apply_recovers")
+                        .env("LINEN_B3_KILL_FIXTURE", dir.path());
+                    if kill {
+                        cmd.env("LINEN_B3_KILL_POINT", point);
+                    }
+                    cmd.output().unwrap()
+                };
+                let killed = child(true);
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(
+                    killed.status.signal(),
+                    Some(libc::SIGKILL),
+                    "{point}: {}",
+                    String::from_utf8_lossy(&killed.stderr)
+                );
+                let resumed = child(false);
+                assert!(
+                    resumed.status.success(),
+                    "{point}: {} {}",
+                    String::from_utf8_lossy(&resumed.stdout),
+                    String::from_utf8_lossy(&resumed.stderr)
+                );
+            }
+        }
+
         fn pass_at(kd: &mut KitDevice, readings: Readings, budgets: &Budgets) -> (Report, State) {
             let state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
             let mut device = Device {
-                conn: kd.db.conn(),
+                db: crate::sync::pass::Database::Test(&kd.db),
+                root: kd.root.path(),
                 lib: kd.lib,
                 store: &mut kd.store,
                 ks: &kd.ks,
@@ -1482,7 +2190,8 @@ mod tests {
             };
             let state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
             let mut device = Device {
-                conn: kd.db.conn(),
+                db: crate::sync::pass::Database::Test(&kd.db),
+                root: kd.root.path(),
                 lib: kd.lib,
                 store: &mut kd.store,
                 ks: &kd.ks,
@@ -1710,7 +2419,8 @@ mod tests {
             kd.folder.remove(&token).unwrap();
             let state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
             let mut device = Device {
-                conn: kd.db.conn(),
+                db: crate::sync::pass::Database::Test(&kd.db),
+                root: kd.root.path(),
                 lib: kd.lib,
                 store: &mut kd.store,
                 ks: &kd.ks,
@@ -1750,6 +2460,76 @@ mod tests {
             let (report, _) = pass(&mut kit.devices[0], &Budgets::sy2());
             assert_eq!(report.received, vec![(peer, 2)], "{report:?}");
             assert_eq!(note_of(&kit.devices[0].db, "book"), None);
+        }
+
+        #[test]
+        fn applied_remote_deletion_keeps_its_vouched_age_across_restart() {
+            use crate::sync::record::Entry;
+            let mut kit = testkit::library(2);
+            kit.devices[1]
+                .db
+                .save_annotation(&highlight("book", Some("remote"), 1_760_000_001_000))
+                .unwrap();
+            kit.devices[1].publish_pending();
+            pass(&mut kit.devices[0], &Budgets::sy2());
+            let id = kit.devices[1].db.annotations("book").unwrap()[0].id.clone();
+            kit.devices[1].db.delete_annotation(&id).unwrap();
+            kit.devices[1].publish_pending();
+            let (_, state) = pass(&mut kit.devices[0], &Budgets::sy2());
+            let kd = &kit.devices[0];
+            let (writer, seq, hash): (String, i64, String) = kd.db.conn().query_row(
+                "SELECT device, seq, hash FROM sync_deleted WHERE library = ?1 AND seq IS NOT NULL LIMIT 1",
+                [kd.lib.id.to_string()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).unwrap();
+            let entry = Entry {
+                device: DeviceId::parse(&writer).unwrap(),
+                seq: seq as u64,
+                hash: Hash32::parse(&hash).unwrap(),
+            };
+            assert_eq!(state.ages.own_age(&entry, state.vouched.now()), Some(0));
+            let loaded = State::load(kd.db.conn(), &kd.lib.id).unwrap();
+            assert_eq!(loaded.ages.own_age(&entry, loaded.vouched.now()), Some(0));
+        }
+
+        #[test]
+        fn quarantined_writers_future_version_cannot_apply_when_clock_catches_up() {
+            let mut kit = testkit::library(2);
+            let peer = kit.devices[1].lib.device;
+            kit.devices[1]
+                .db
+                .save_annotation(&highlight("book", Some("future"), 1_760_000_001_000))
+                .unwrap();
+            let sender = &kit.devices[1];
+            let mut batch = crate::sync::apply::tests::publish_next(sender.db.conn(), &sender.lib)
+                .unwrap()
+                .unwrap();
+            for version in &mut batch.versions {
+                version["clock"] = serde_json::json!([READ.wall_ms + 30 * 60 * 60 * 1000, 0]);
+            }
+            let kd = &mut kit.devices[0];
+            crate::sync::apply::receive(kd.db.conn(), &kd.lib, &batch, READ.wall_ms as i64)
+                .unwrap();
+            let mut state = State::load(kd.db.conn(), &kd.lib.id).unwrap();
+            state.membership.quarantined.insert(peer, None);
+            save_raw(kd, &state);
+            let future = Readings {
+                wall_ms: READ.wall_ms + 2 * 24 * 60 * 60 * 1000,
+                ..READ
+            };
+            pass_at(kd, future, &Budgets::sy2());
+            assert!(kd.db.annotations("book").unwrap().is_empty());
+            let held: i64 = kd
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_versions WHERE device = ?1 AND applied = -5",
+                    [peer.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(held > 0, "the future version is held as a late change");
+            pass_at(kd, future, &Budgets::sy2());
+            assert!(kd.db.annotations("book").unwrap().is_empty());
         }
 
         #[test]
