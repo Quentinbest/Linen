@@ -44,6 +44,13 @@ Rust comes from `rust-toolchain.toml`; a bump is its own PR. The in-app suite an
 - **Comments cite rule IDs** (`// B8: …`). Don't commit the `*.txt` session exports in the root.
 - **Codex** only non-interactively (`codex exec … -s read-only`, `codex review`): never bare `codex`, never `~/.codex/`, never `--dangerously-bypass-approvals-and-sandbox`.
 
+### Build output and worktree cleanup
+
+- **Reuse the task's worktree** for follow-ups and PR review rounds. Use the current checkout for read-only investigation.
+- **Run optional checks when the result will affect the next step.** If the required pre-commit run will answer the same question in time, use that run. Build native spikes, release bundles, additional architectures, or fuzz targets when they cover behavior or deliverables the task requires. Follow the verification requirements in Done means.
+- **Keep scratch output in a task-specific temporary directory.** Clean it up when finished and preserve evidence needed for review or reproduction. When investigating unexpected Rust build growth, measure `target/` by subdirectory with `du` before and after the next required build or test command.
+- **Account for retained files at task close.** If the task used a worktree or produced build artifacts, report the worktree and generated outputs it leaves behind. Before removing a completed worktree, check for local changes (including untracked files), confirm its commits are retained, and inspect ignored output for evidence or release packages worth keeping. When cleanup is authorized, use `git worktree remove` and keep the branch.
+
 ## Releases
 
 Bump `version` in `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`, add the `CHANGELOG.md` entry (`## vX.Y.Z — YYYY-MM-DD`, user-facing), and push the `vX.Y.Z` tag; the release workflow makes a draft. Before the owner publishes it, the candidate is tried as [`docs/release-acceptance.md`](docs/release-acceptance.md) says. The update key (`~/.tauri/linen-updater.key`) is never committed: the repository is public.
