@@ -25,7 +25,7 @@ Linen is a quiet EPUB reader for macOS. It keeps out of the book's way: the text
 ### Install
 
 1. You need **macOS 13 or later, with Safari 16.4 or later.** Linen reads books with the system's WebKit, which comes with Safari. On an older WebKit, Linen says so and offers Software Update instead of opening a book.
-2. Download the DMG from the [latest release](https://github.com/Quentinbest/read-book/releases/latest): `aarch64` for Apple silicon, `x64` for Intel Macs. Open it and drag Linen to Applications.
+2. Download the DMG from the [latest release](https://github.com/Quentinbest/Linen/releases/latest): `aarch64` for Apple silicon, `x64` for Intel Macs. Open it and drag Linen to Applications.
 3. **The first open.** Linen is not yet signed with an Apple Developer ID, so macOS asks before opening it. Control-click Linen and choose **Open**, then **Open** again; or open it once, then choose **Open Anyway** in System Settings › Privacy & Security.
 
 Linen checks for an update once a day and installs signed updates by itself. What changed in each version is in [`CHANGELOG.md`](CHANGELOG.md).
@@ -63,8 +63,8 @@ Linen sends nothing anywhere. If something goes wrong, the details go to a crash
 You need a Mac with the Xcode command-line tools, [Rust](https://rustup.rs) (`rustup` installs the version in `rust-toolchain.toml`), Node.js 24 and pnpm (`corepack enable` gives the version in `package.json`).
 
 ```sh
-git clone https://github.com/Quentinbest/read-book.git
-cd read-book
+git clone https://github.com/Quentinbest/Linen.git
+cd Linen
 pnpm install        # also applies patches/foliate-js@0.0.0.patch
 pnpm tauri dev      # run the app
 ```

@@ -27,7 +27,7 @@ Linen 是一款安静的 macOS EPUB 阅读器。它不打扰你读书：正文�
 ### 安装
 
 1. 需要 **macOS 13 或更高版本，并安装 Safari 16.4 或更高版本。** Linen 使用随 Safari 提供的系统 WebKit 排版书籍。如果 WebKit 版本过旧，Linen 会给出提示并引导你前往软件更新，而不会打开书籍。
-2. 从[最新版本](https://github.com/Quentinbest/read-book/releases/latest)下载 DMG：Apple 芯片选择 `aarch64`，Intel 芯片的 Mac 选择 `x64`。打开 DMG，把 Linen 拖到“应用程序”文件夹。
+2. 从[最新版本](https://github.com/Quentinbest/Linen/releases/latest)下载 DMG：Apple 芯片选择 `aarch64`，Intel 芯片的 Mac 选择 `x64`。打开 DMG，把 Linen 拖到“应用程序”文件夹。
 3. **首次打开。** Linen 尚未使用 Apple Developer ID 签名，因此 macOS 会在打开前询问。按住 Control 键点按 Linen，选择“打开”，再点“打开”；或者先打开一次，然后在“系统设置 › 隐私与安全性”中选择“仍要打开”。
 
 Linen 每天检查一次更新，并自动安装经过签名的更新。各版本的改动见 [`CHANGELOG.md`](CHANGELOG.md)（英文）。
@@ -65,8 +65,8 @@ Linen 不会向任何地方发送任何数据。出现问题时，详情只写�
 需要一台装有 Xcode 命令行工具、[Rust](https://rustup.rs)（stable）、Node.js 24 和 pnpm 的 Mac（`corepack enable` 会使用 `package.json` 中指定的版本）。
 
 ```sh
-git clone https://github.com/Quentinbest/read-book.git
-cd read-book
+git clone https://github.com/Quentinbest/Linen.git
+cd Linen
 pnpm install        # 同时应用 patches/foliate-js@0.0.0.patch
 pnpm tauri dev      # 运行应用
 ```

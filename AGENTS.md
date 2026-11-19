@@ -5,7 +5,7 @@ Linen is a quiet EPUB reader for macOS: Tauri 2 (Rust core), Svelte 5 (runes) an
 ## Where things are
 
 - **The plan**, `docs/implementation-plan.md`, is **read-only**. Its rule IDs (B8, S14, L16…) are cited in code comments and tests; later work has its own plan (`docs/*-plan.md`) with its own IDs (LK, SB…).
-- **State and decisions:** `docs/PROGRESS.md`, the status documents, `docs/decisions.md` (what the owner decided) and `docs/pending-approvals.md` (questions waiting on the owner). Open work (deferred findings, follow-ups, checks still to do) is in [GitHub Issues](https://github.com/Quentinbest/read-book/issues), the one backlog.
+- **State and decisions:** `docs/PROGRESS.md`, the status documents, `docs/decisions.md` (what the owner decided) and `docs/pending-approvals.md` (questions waiting on the owner). Open work (deferred findings, follow-ups, checks still to do) is in [GitHub Issues](https://github.com/Quentinbest/Linen/issues), the one backlog.
 - **The design** is `docs/design/` with a text export in `docs/design/text/`. All UI text is in `src/lib/strings/`; foliate-js is reached only through `src/reader/engine.ts`.
 
 ## Commands

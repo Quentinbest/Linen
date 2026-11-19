@@ -15,7 +15,7 @@
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-REPO=Quentinbest/read-book
+REPO=Quentinbest/Linen
 APP=${LINEN_RC_APP:-/Applications/Linen.app}
 DATA=${LINEN_RC_DATA:-"$HOME/Library/Application Support/app.linen.reader"}
 STAMP=$(date +%Y%m%d-%H%M%S)

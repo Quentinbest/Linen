@@ -16,7 +16,7 @@ const SETTING: &str = "updateCheckedAt";
 /// Item 32: the last version announced as “available” to an install that cannot update itself.
 const ANNOUNCED: &str = "updateAnnounced";
 /// Where “Download” goes: the release page of that version, on the update source (item 29).
-const RELEASES: &str = "https://github.com/Quentinbest/read-book/releases/tag/v";
+const RELEASES: &str = "https://github.com/Quentinbest/Linen/releases/tag/v";
 const DAY: u64 = 24 * 60 * 60;
 /// How often the loop looks at the clock (a Mac asleep overnight still checks on waking).
 const TICK: Duration = Duration::from_secs(60 * 60);

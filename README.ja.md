@@ -27,7 +27,7 @@ Linen は、macOS 用の静かな EPUB リーダーです。本の邪魔をし�
 ### インストール
 
 1. **macOS 13 以降と、Safari 16.4 以降** が必要です。Linen は Safari に含まれるシステムの WebKit でブックを表示します。WebKit が古い場合、Linen はブックを開く代わりにその旨を伝え、ソフトウェアアップデートを案内します。
-2. [最新のリリース](https://github.com/Quentinbest/read-book/releases/latest)から DMG をダウンロードします。Apple シリコンの Mac は `aarch64`、Intel プロセッサの Mac は `x64` です。DMG を開き、Linen を「アプリケーション」フォルダにドラッグします。
+2. [最新のリリース](https://github.com/Quentinbest/Linen/releases/latest)から DMG をダウンロードします。Apple シリコンの Mac は `aarch64`、Intel プロセッサの Mac は `x64` です。DMG を開き、Linen を「アプリケーション」フォルダにドラッグします。
 3. **初めて開くとき。** Linen はまだ Apple Developer ID で署名されていないため、開く前に macOS が確認します。Control キーを押しながら Linen をクリックして「開く」を選び、もう一度「開く」をクリックします。または一度開いてから、「システム設定 › プライバシーとセキュリティ」で「このまま開く」を選びます。
 
 Linen は 1 日に 1 回アップデートを確認し、署名されたアップデートを自動でインストールします。各バージョンの変更点は [`CHANGELOG.md`](CHANGELOG.md)（英語）にあります。
@@ -65,8 +65,8 @@ Linen はどこにも何も送信しません。問題が起きたときは、�
 Xcode コマンドラインツール、[Rust](https://rustup.rs)（stable）、Node.js 24、pnpm を入れた Mac が必要です（`corepack enable` で `package.json` に指定されたバージョンが使われます）。
 
 ```sh
-git clone https://github.com/Quentinbest/read-book.git
-cd read-book
+git clone https://github.com/Quentinbest/Linen.git
+cd Linen
 pnpm install        # patches/foliate-js@0.0.0.patch も適用されます
 pnpm tauri dev      # アプリを起動
 ```
