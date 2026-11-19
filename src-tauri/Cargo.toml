@@ -48,10 +48,11 @@ hkdf = "0.13.0"
 hmac = "0.13.0"
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc"] }
 getrandom = "0.4.3"
+tempfile = { version = "3", optional = true }
 
 [features]
 # Phase 0 spike harness (docs/spikes/). Never enabled in product builds.
-spikes = []
+spikes = ["dep:tempfile"]
 
 [dev-dependencies]
 tempfile = "3"

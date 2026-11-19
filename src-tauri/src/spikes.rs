@@ -13,6 +13,8 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 use tauri::{ipc::Response, AppHandle, Manager, Runtime};
 
+pub(crate) mod sync_slice;
+
 pub const CANARY_ADDR: &str = "127.0.0.1:8765";
 
 #[derive(Default, Serialize, Clone)]
@@ -202,7 +204,9 @@ fn start_canary_server<R: Runtime>(app: AppHandle<R>) {
 }
 
 pub fn install<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
-    builder.manage(SpikeState(Mutex::new(CanaryLog::default())))
+    builder
+        .manage(SpikeState(Mutex::new(CanaryLog::default())))
+        .manage(sync_slice::SyncSlice::default())
 }
 
 /// Spike G: install a probe extension from `src-tauri/tests/fixtures/ext/<id>` into
