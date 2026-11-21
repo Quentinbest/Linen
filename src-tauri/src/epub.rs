@@ -15,11 +15,37 @@ use std::path::Path;
 pub const MAX_ENTRIES: usize = 10_000;
 pub const MAX_TOTAL_UNCOMPRESSED: u64 = 1 << 30;
 pub const MAX_RATIO: u64 = 100;
+/// Approved per-entry limit for EPUB text/markup entries (plan §7.1, #87, 2026-11-21):
+/// checked before reading so a single chapter cannot exceed the 400 MB memory budget (§6.4).
+pub const MAX_TEXT_ENTRY_BYTES: u64 = 16 << 20;
 /// Entries smaller than this are exempt from the ratio check: tiny files such as
 /// a run of spaces legitimately compress far better than 100:1.
 const RATIO_EXEMPT_BELOW: u64 = 64 * 1024;
 /// XML documents are parsed in memory; anything larger is not a real OPF or nav.
-const MAX_XML_BYTES: u64 = 16 << 20;
+const MAX_XML_BYTES: u64 = MAX_TEXT_ENTRY_BYTES;
+
+/// Plan §7.1, #87: entries decoded as text/markup into JS strings or DOM.
+pub fn is_text_entry(name: &str) -> bool {
+    let Some((_, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "xhtml" | "html" | "htm" | "xml" | "opf" | "ncx" | "css" | "svg" | "smil" | "txt"
+    )
+}
+
+fn is_text_media_type(media_type: &str) -> bool {
+    let mime = media_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    mime.starts_with("text/")
+        || mime.ends_with("+xml")
+        || matches!(mime.as_str(), "application/xml" | "application/xhtml+xml")
+}
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum Rejection {
@@ -219,9 +245,12 @@ fn read_xml<R: Read + Seek>(
     }
     let mut bytes = Vec::with_capacity(entry.size() as usize);
     entry
-        .take(MAX_XML_BYTES)
+        .take(MAX_XML_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|_| Rejection::NotZip)?;
+    if bytes.len() as u64 > MAX_XML_BYTES {
+        return Err(Rejection::BadPackage);
+    }
     let text = String::from_utf8_lossy(&bytes).into_owned();
     check_xml_entities(name, &text)?;
     Ok(Some(text))
@@ -629,13 +658,28 @@ pub fn read_package<R: Read + Seek>(
     for id in &spine_ids {
         match manifest.get(id) {
             Some(item) => {
-                if entries.contains(&item.href) {
-                    spine.push(item.href.clone());
-                } else {
-                    damage.push(Damage {
+                // Look up the exact index `by_decoded_name` will open, so duplicate zip names
+                // cannot hide an oversized chapter behind a small entry.
+                let size = names
+                    .index(archive, &item.href)
+                    .and_then(|i| archive.by_index_raw(i).ok())
+                    .map(|e| e.size());
+                match size {
+                    Some(size)
+                        if (is_text_entry(&item.href) || is_text_media_type(&item.media_type))
+                            && size > MAX_TEXT_ENTRY_BYTES =>
+                    {
+                        // E3, §7.1, #87: oversized chapters stay out of the reader as damaged items.
+                        damage.push(Damage {
+                            item_href: item.href.clone(),
+                            error_kind: "too-large".into(),
+                        });
+                    }
+                    Some(_) => spine.push(item.href.clone()),
+                    None => damage.push(Damage {
                         item_href: item.href.clone(),
                         error_kind: "missing".into(),
-                    });
+                    }),
                 }
             }
             None => damage.push(Damage {
@@ -1142,5 +1186,56 @@ mod tests {
             read_package(&mut a),
             Err(Rejection::XmlEntities("OEBPS/content.opf".into()))
         );
+    }
+
+    #[test]
+    fn oversized_text_spine_chapter_is_marked_damaged_e3() {
+        let package = opf(
+            "<dc:title>Giant Chapter</dc:title>",
+            r#"<item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+               <item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/>
+               <item id="img" href="plate.png" media-type="image/png"/>"#,
+            r#"><itemref idref="c1"/><itemref idref="c2"/>"#,
+        );
+        let mut huge_chapter = b"<!DOCTYPE html><html><body><p>".to_vec();
+        huge_chapter.resize(MAX_TEXT_ENTRY_BYTES as usize + 1, b'a');
+        let huge_image = vec![0u8; MAX_TEXT_ENTRY_BYTES as usize + 1];
+
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, data) in [
+                ("META-INF/container.xml", CONTAINER),
+                ("OEBPS/content.opf", package.as_slice()),
+                (
+                    "OEBPS/c1.xhtml",
+                    b"<html><body><h1>Chapter 1</h1></body></html>".as_slice(),
+                ),
+                ("OEBPS/c2.xhtml", huge_chapter.as_slice()),
+                ("OEBPS/plate.png", huge_image.as_slice()),
+            ] {
+                zw.start_file(name, stored).unwrap();
+                zw.write_all(data).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf)).unwrap();
+        validate_archive(&mut archive).unwrap();
+        let pkg = read_package(&mut archive).unwrap();
+        assert_eq!(pkg.spine, vec!["OEBPS/c1.xhtml"]);
+        assert_eq!(
+            pkg.damage,
+            vec![Damage {
+                item_href: "OEBPS/c2.xhtml".into(),
+                error_kind: "too-large".into(),
+            }]
+        );
+        assert!(is_text_entry("OEBPS/c2.XHTML"));
+        assert!(is_text_entry("OEBPS/style.css"));
+        assert!(is_text_entry("OEBPS/fig.svg"));
+        assert!(!is_text_entry("OEBPS/plate.png"));
+        assert!(!is_text_entry("OEBPS/font.woff2"));
     }
 }

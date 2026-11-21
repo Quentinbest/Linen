@@ -223,32 +223,51 @@ pub fn book_entries(state: State<AppState>, book_id: String) -> CmdResult<Vec<(S
     })
 }
 
-/// L17: one entry of the open book, read from the zip on demand.
+/// L17, §7.1, #87: one entry of the open book, read from the zip on demand.
+/// Text/markup entries (or any read marked `text`) are capped at `MAX_TEXT_ENTRY_BYTES`
+/// before reading so a single oversized chapter cannot blow the 400 MB memory budget.
 #[tauri::command]
 pub fn book_entry(
     state: State<AppState>,
     book_id: String,
     name: String,
+    text: Option<bool>,
 ) -> CmdResult<tauri::ipc::Response> {
+    let limit = entry_limit(&name, text.unwrap_or(false));
     with_open_book(&state, &book_id, |archive| {
-        read_entry(archive, &name).map(tauri::ipc::Response::new)
+        read_entry(archive, &name, limit).map(tauri::ipc::Response::new)
     })
 }
 
-/// One entry's bytes, capped at MAX_ENTRY_BYTES.
-fn read_entry(archive: &mut zip::ZipArchive<std::fs::File>, name: &str) -> CmdResult<Vec<u8>> {
+fn entry_limit(name: &str, text: bool) -> u64 {
+    if text || crate::epub::is_text_entry(name) {
+        crate::epub::MAX_TEXT_ENTRY_BYTES
+    } else {
+        MAX_ENTRY_BYTES
+    }
+}
+
+/// One entry's bytes, checked against `limit` both before allocating and while decompressing.
+fn read_entry<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+    limit: u64,
+) -> CmdResult<Vec<u8>> {
     use std::io::Read;
     let failed = |e: String| CommandError::Failed { message: e };
     let entry =
         crate::epub::by_decoded_name(archive, name).map_err(|e| failed(format!("{name}: {e}")))?;
-    if entry.size() > MAX_ENTRY_BYTES {
+    if entry.size() > limit {
         return Err(failed(format!("{name} is too large")));
     }
     let mut bytes = Vec::with_capacity(entry.size() as usize);
     entry
-        .take(MAX_ENTRY_BYTES)
+        .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|e| failed(e.to_string()))?;
+    if bytes.len() as u64 > limit {
+        return Err(failed(format!("{name} is too large")));
+    }
     Ok(bytes)
 }
 
@@ -340,7 +359,7 @@ pub fn serve_book_media(
     if *open_id != book_id {
         return reply(StatusCode::NOT_FOUND);
     }
-    match read_entry(archive, &entry) {
+    match read_entry(archive, &entry, MAX_ENTRY_BYTES) {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", mime)
@@ -1181,7 +1200,9 @@ mod quit_tests {
 
 #[cfg(test)]
 mod book_scheme_tests {
-    use super::{media_type, parse_book_path};
+    use super::{entry_limit, media_type, parse_book_path, read_entry, MAX_ENTRY_BYTES};
+    use crate::epub::MAX_TEXT_ENTRY_BYTES;
+    use std::io::{Cursor, Write};
 
     #[test]
     fn serves_only_media_types() {
@@ -1204,5 +1225,53 @@ mod book_scheme_tests {
         );
         assert_eq!(parse_book_path("/abc123"), None);
         assert_eq!(parse_book_path("/abc/%zz.png"), None);
+    }
+
+    #[test]
+    fn entry_limit_caps_text_and_keeps_media_limit() {
+        for name in ["c.xhtml", "c.HTML", "s.css", "i.svg", "toc.ncx", "a.xml"] {
+            assert_eq!(entry_limit(name, false), MAX_TEXT_ENTRY_BYTES, "{name}");
+        }
+        assert_eq!(
+            entry_limit("chapter_without_ext", true),
+            MAX_TEXT_ENTRY_BYTES
+        );
+        assert_eq!(entry_limit("OEBPS/plate.png", false), MAX_ENTRY_BYTES);
+        assert_eq!(entry_limit("OEBPS/font.woff2", false), MAX_ENTRY_BYTES);
+    }
+
+    #[test]
+    fn read_entry_refuses_oversized_text_entry_and_enforces_stream_cap() {
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("OEBPS/small.xhtml", stored).unwrap();
+            zw.write_all(b"<p>hello</p>").unwrap();
+            zw.start_file("OEBPS/huge.xhtml", stored).unwrap();
+            zw.write_all(&vec![b'x'; MAX_TEXT_ENTRY_BYTES as usize + 1])
+                .unwrap();
+            zw.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf)).unwrap();
+        assert_eq!(
+            read_entry(
+                &mut archive,
+                "OEBPS/small.xhtml",
+                entry_limit("OEBPS/small.xhtml", true)
+            )
+            .unwrap(),
+            b"<p>hello</p>"
+        );
+        assert!(read_entry(
+            &mut archive,
+            "OEBPS/huge.xhtml",
+            entry_limit("OEBPS/huge.xhtml", false),
+        )
+        .is_err());
+        // Exact boundary passes; one byte under refuses.
+        assert!(read_entry(&mut archive, "OEBPS/small.xhtml", 12).is_ok());
+        assert!(read_entry(&mut archive, "OEBPS/small.xhtml", 11).is_err());
     }
 }

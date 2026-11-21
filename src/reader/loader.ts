@@ -11,6 +11,17 @@ export interface EntryLoader {
   urlFor?(name: string, type: string): string | null
 }
 
+/** Must match `epub::MAX_TEXT_ENTRY_BYTES` in the core (plan §7.1, #87, 2026-11-21). */
+export const MAX_TEXT_ENTRY_BYTES = 16 * 1024 * 1024
+
+/** Must match `epub::is_text_entry` in the core: entries decoded as text or markup. */
+export function isTextEntry(name: string, type?: string): boolean {
+  if (/\.(xhtml|html?|xml|opf|ncx|css|svg|smil|txt)$/i.test(name)) return true
+  if (!type) return false
+  const mime = type.split(';')[0].trim().toLowerCase()
+  return mime.startsWith('text/') || mime.endsWith('+xml') || mime === 'application/xml'
+}
+
 /** Must match `commands::media_type` in the core: the types served on the book scheme. */
 const DIRECT_MEDIA = /^(image\/(png|jpeg|gif|webp|avif|bmp)|audio\/|video\/)/
 
@@ -41,15 +52,21 @@ export function directMediaUrl(bookId: string, name: string, type: string): stri
 
 export async function libraryLoader(bookId: string): Promise<EntryLoader> {
   const entries = new Map(await invoke<[string, number][]>('book_entries', { bookId }))
-  const bytes = (name: string) => invoke<ArrayBuffer>('book_entry', { bookId, name })
+  const bytes = (name: string, text: boolean) =>
+    invoke<ArrayBuffer>('book_entry', { bookId, name, text })
   return {
     async loadText(name) {
-      if (!entries.has(name)) return null
-      return new TextDecoder().decode(await bytes(name))
+      const size = entries.get(name)
+      // §7.1, #87: skip oversized text chapters before crossing IPC (E3 treats null as damaged).
+      if (size === undefined || size > MAX_TEXT_ENTRY_BYTES) return null
+      return new TextDecoder().decode(await bytes(name, true))
     },
     async loadBlob(name, type) {
-      if (!entries.has(name)) return null
-      return new Blob([await bytes(name)], type ? { type } : undefined)
+      const size = entries.get(name)
+      if (size === undefined) return null
+      const text = isTextEntry(name, type)
+      if (text && size > MAX_TEXT_ENTRY_BYTES) return null
+      return new Blob([await bytes(name, text)], type ? { type } : undefined)
     },
     getSize: (name) => entries.get(name) ?? 0,
     // Images, audio and video load straight from the zip: as blobs, WebKit kept
