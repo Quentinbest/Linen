@@ -7110,20 +7110,46 @@ export async function spikeE2E(): Promise<SpikeResult> {
       await toLoomings()
       await dict.add('dict-basic.mdx')
       await emit('dictionaries-changed')
-      await lookUpInBook('spleen')
-      const frame = await waitFor('the entry frame', dictFrame, 3000)
-      await settled(900)
-      const r = frame.getBoundingClientRect()
-      // “see cache” is a 44 px block at the top of the entry (the fixture puts it there).
-      await realMouse(r.left + 40, r.top + 30, true)
-      await waitFor(
-        'Back',
-        () =>
-          Array.from(lensPeek()?.querySelectorAll('button') ?? []).find((b) =>
-            /^Back$/.test(b.textContent ?? ''),
-          ),
-        3000,
-      ).catch(() => problems.push('the entry link did not navigate the frame'))
+      await withCursor(async () => {
+        await lookUpInBook('spleen')
+        const frame = await waitFor('the entry frame', dictFrame, 3000)
+        // #83: wait for the initial linen-dict:// load before clicking (Back appears at frameLoads > 1).
+        await waitFor(
+          'initial entry frame load',
+          () => Number(dictFrame()?.dataset.frameLoads ?? 0) >= 1,
+          5000,
+        ).catch(() => problems.push('the initial entry frame did not finish loading'))
+        frame.scrollIntoView({ block: 'nearest' })
+        await settled(300)
+        const r = frame.getBoundingClientRect()
+        // “see cache” is a 44 px block at the top of the entry (body padding 10px 12px + 1px border).
+        const clickX = Math.round(r.left + Math.min(40, r.width / 2))
+        const clickY = Math.round(r.top + 30)
+        // As a hand would: arrive over the sandboxed frame before pressing (a click straight
+        // after a jump into a subframe can be lost).
+        await realMouse(clickX, clickY, false)
+        await settled(200)
+        await realMouse(clickX, clickY, true)
+        await waitFor(
+          'Back',
+          () =>
+            Array.from(lensPeek()?.querySelectorAll('button') ?? []).find((b) =>
+              /^Back$/.test(b.textContent ?? ''),
+            ),
+          3000,
+        ).catch(() => {
+          const p = lensPeek()?.getBoundingClientRect()
+          const a = lensPeek()?.querySelector('.answer')?.getBoundingClientRect()
+          const loads = dictFrame()?.dataset.frameLoads ?? '?'
+          const box = (b: DOMRect | undefined) =>
+            b
+              ? `${Math.round(b.left)},${Math.round(b.top)} ${Math.round(b.width)}×${Math.round(b.height)}`
+              : 'none'
+          problems.push(
+            `the entry link did not navigate the frame (click ${clickX},${clickY}; frame ${box(r)}; answer ${box(a)}; peek ${box(p)}; loads=${loads}; focus=${document.hasFocus()})`,
+          )
+        })
+      })
       Array.from(lensPeek()?.querySelectorAll<HTMLButtonElement>('button') ?? [])
         .find((b) => /^Back$/.test(b.textContent ?? ''))
         ?.click()

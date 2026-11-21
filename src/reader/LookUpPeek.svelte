@@ -328,6 +328,7 @@
             sandbox=""
             referrerpolicy="no-referrer"
             data-dict-frame
+            data-frame-loads={frameLoads}
             onload={() => (frameLoads += 1)}
           ></iframe>
         {/key}
