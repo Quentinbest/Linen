@@ -731,6 +731,30 @@ pub fn read_package<R: Read + Seek>(
     })
 }
 
+/// Plan §7.1, E3, #87: find spine text items exceeding `MAX_TEXT_ENTRY_BYTES` in an
+/// existing library archive without decompressing chapters. Short-circuits in one
+/// central-directory scan when no entry exceeds the cap.
+pub fn oversized_text_spine_entries<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Vec<String> {
+    let any_large = (0..archive.len()).any(|i| {
+        archive
+            .by_index_raw(i)
+            .is_ok_and(|e| e.size() > MAX_TEXT_ENTRY_BYTES)
+    });
+    if !any_large {
+        return Vec::new();
+    }
+    let Ok(pkg) = read_package(archive) else {
+        return Vec::new();
+    };
+    pkg.damage
+        .into_iter()
+        .filter(|d| d.error_kind == "too-large")
+        .map(|d| d.item_href)
+        .collect()
+}
+
 /// An `EncryptedData` whose algorithm is not one of the two font-obfuscation
 /// algorithms means the book is DRM-protected (B9, detection only).
 fn drm_encrypted_item(xml: &str) -> Option<String> {

@@ -79,11 +79,44 @@ pub fn init<R: Runtime>(app: &tauri::App<R>) -> Result<AppState, Box<dyn std::er
     let mut store = Store::open(&root.join("linen.db"))?;
     let library = Library::new(&root)?;
     purge_removed(&mut store, &library);
+    refresh_existing_book_damage(&mut store, &library);
     Ok(AppState {
         store: Mutex::new(store),
         library,
         open_book: Mutex::new(None),
     })
+}
+
+/// Plan §7.1, E3, #87: backfill `too-large` `book_damage` rows once for books imported
+/// before the 16 MiB text-entry cap, so the library shows the E3 damaged-book card
+/// and Contents marks the unavailable chapter.
+pub fn refresh_existing_book_damage(store: &mut Store, library: &Library) {
+    const FLAG: &str = "textCapChecked:16m";
+    if store.setting(FLAG).ok().flatten().as_deref() == Some("1") {
+        return;
+    }
+    let Ok(books) = store.books() else {
+        return;
+    };
+    for book in books {
+        let Some(path) = library.book_file(&book.file_path) else {
+            continue;
+        };
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let Ok(mut archive) = zip::ZipArchive::new(file) else {
+            continue;
+        };
+        let oversized = crate::epub::oversized_text_spine_entries(&mut archive);
+        for href in oversized {
+            let _ = store.conn().execute(
+                "INSERT OR IGNORE INTO book_damage (book_id, item_href, error_kind) VALUES (?1, ?2, 'too-large')",
+                rusqlite::params![book.id, href],
+            );
+        }
+    }
+    let _ = store.set_setting(FLAG, "1");
 }
 
 /// G4 (provisional): books removed in an earlier session go for good at launch,
@@ -678,13 +711,30 @@ pub fn annotation_restore(state: State<AppState>, id: String) -> CmdResult<()> {
     Ok(state.store.lock().unwrap().restore_annotation(&id)?)
 }
 
-/// E3, N6: the book's damaged spine items (zip paths), recorded at import.
+/// E3, N6, #87: the book's damaged spine items (zip paths), recorded at import or
+/// backfilled from the open archive when an existing book predates the text-entry cap.
 #[tauri::command]
 pub fn book_damage(state: State<AppState>, book_id: String) -> CmdResult<Vec<String>> {
     let failed = |e: rusqlite::Error| CommandError::Failed {
         message: e.to_string(),
     };
+    // Lock `open_book` before `store` (same order as `with_open_book`, never nested the other way).
+    let oversized = {
+        let mut open = state.open_book.lock().unwrap();
+        match open.as_mut() {
+            Some((id, archive)) if id == &book_id => {
+                crate::epub::oversized_text_spine_entries(archive)
+            }
+            _ => Vec::new(),
+        }
+    };
     let store = state.store.lock().unwrap();
+    for href in oversized {
+        let _ = store.conn().execute(
+            "INSERT OR IGNORE INTO book_damage (book_id, item_href, error_kind) VALUES (?1, ?2, 'too-large')",
+            rusqlite::params![&book_id, href],
+        );
+    }
     let mut stmt = store
         .conn()
         .prepare("SELECT item_href FROM book_damage WHERE book_id = ?1 ORDER BY item_href")
@@ -1273,5 +1323,67 @@ mod book_scheme_tests {
         // Exact boundary passes; one byte under refuses.
         assert!(read_entry(&mut archive, "OEBPS/small.xhtml", 12).is_ok());
         assert!(read_entry(&mut archive, "OEBPS/small.xhtml", 11).is_err());
+    }
+
+    #[test]
+    fn refresh_existing_book_damage_backfills_pre_cap_books() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = crate::import::Library::new(tmp.path()).unwrap();
+        let mut store = crate::store::Store::open(&tmp.path().join("linen.db")).unwrap();
+
+        // Build an EPUB with one normal chapter and one >16 MiB chapter, stored directly
+        // as a pre-#87 library book without any `book_damage` rows.
+        let epub_path = lib.books_dir.join("precap-1234567890ab.epub");
+        {
+            let file = std::fs::File::create(&epub_path).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let container = br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#;
+            let opf = br#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>PreCap</dc:title></metadata><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#;
+            let mut huge = b"<!DOCTYPE html><html><body><p>".to_vec();
+            huge.resize(MAX_TEXT_ENTRY_BYTES as usize + 1, b'a');
+            for (name, data) in [
+                ("META-INF/container.xml", container.as_slice()),
+                ("OEBPS/content.opf", opf.as_slice()),
+                (
+                    "OEBPS/c1.xhtml",
+                    b"<html><body><p>ok</p></body></html>".as_slice(),
+                ),
+                ("OEBPS/c2.xhtml", huge.as_slice()),
+            ] {
+                zw.start_file(name, stored).unwrap();
+                zw.write_all(data).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+
+        store
+            .conn()
+            .execute(
+                "INSERT INTO books (id, content_hash, file_path, title, title_source, authors,
+                     page_direction, layout, has_page_list, a11y_metadata, added_at)
+                 VALUES ('b1', 'hash1', ?1, 'PreCap', 'opf', '[]', 'default', 'reflowable', 0, '[]', 1)",
+                [epub_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        assert_eq!(store.books().unwrap()[0].damaged_items, 0);
+
+        super::refresh_existing_book_damage(&mut store, &lib);
+
+        assert_eq!(store.books().unwrap()[0].damaged_items, 1);
+        let row: (String, String) = store
+            .conn()
+            .query_row(
+                "SELECT item_href, error_kind FROM book_damage WHERE book_id = 'b1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("OEBPS/c2.xhtml".into(), "too-large".into()));
+        assert_eq!(
+            store.setting("textCapChecked:16m").unwrap().as_deref(),
+            Some("1")
+        );
     }
 }
