@@ -88,26 +88,28 @@ describe('E6 library order', () => {
     )
     // E6, plan §6.4 (cold start to the library < 1 s with this 500-book fixture):
     // the three sorts take about 9 ms warm. One wall-clock run fails whenever the
-    // machine is busy (#110), so warm up once and take the fastest of 10 runs,
-    // which stays at 8–12 ms under load; 20 ms still fails a 3× slowdown (~24 ms).
-    // On a saturated machine (one-minute load at or above the core count, as when
-    // another session runs the browser suite) even the fastest run reached 29 ms,
-    // so there the time is reported, not asserted; the order checks below still run.
+    // machine is busy (#110), so warm up once and take the fastest of 20 runs,
+    // which stays at 8–12 ms locally (20 ms still fails a 3× slowdown).
+    // On shared CI runners (#233), host CPU contention can push a run just over 20 ms
+    // without raising guest loadavg above availableParallelism, so CI uses a 40 ms cap.
+    // On a saturated machine (load at or above core count) the time is reported only;
+    // the order checks below still run.
     const sortAll = () =>
       [sortBooks(books, 'title'), sortBooks(books, 'author'), sortBooks(books, 'recent')] as const
     sortAll()
     let fastest = Infinity
-    for (let run = 0; run < 10; run++) {
+    for (let run = 0; run < 20; run++) {
       const t0 = performance.now()
       sortAll()
       fastest = Math.min(fastest, performance.now() - t0)
     }
     const [load] = loadavg()
+    const limitMs = process.env.CI ? 40 : 20
     if (load >= availableParallelism())
       console.warn(
         `E6 timing not asserted: load ${load.toFixed(1)}, fastest ${fastest.toFixed(1)} ms`,
       )
-    else expect(fastest).toBeLessThan(20)
+    else expect(fastest).toBeLessThan(limitMs)
     const [byTitle, byAuthor, recent] = sortAll()
     for (const list of [byTitle, byAuthor, recent])
       expect(new Set(list.map((b) => b.id)).size).toBe(500)
