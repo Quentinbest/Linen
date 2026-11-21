@@ -1,0 +1,148 @@
+{
+  "date": "2026-11-21",
+  "machine": "Mac18,5 (Apple M6, 24 GiB)",
+  "os": "macOS 27.2.1 (26B131)",
+  "webkit": "22625.2.8.11.9",
+  "google_drive_for_desktop": "134.0 (File Provider)",
+  "scope": "One Mac, two throwaway test libraries (LINEN_DATA_DIR) through a temporary Linen-spike folder deleted afterwards (SD3)",
+  "local_baseline": {
+    "criteria": {
+      "SY-nothing-without-setup": "pass",
+      "SY-place-resume": "pass",
+      "SY-highlight-roundtrip": "pass"
+    },
+    "timings_ms": {
+      "setup": 59,
+      "pass_a1": 28,
+      "pass_b1": 9,
+      "pass_b2": 17,
+      "pass_a2": 7
+    },
+    "file_counts": {
+      "after_setup": 7,
+      "after_pass_b1": 15,
+      "after_pass_a2": 18
+    }
+  },
+  "icloud_drive": {
+    "root": "~/Library/Mobile Documents/com~apple~CloudDocs/Linen-spike",
+    "criteria": {
+      "SY-nothing-without-setup": "pass",
+      "SY-place-resume": "pass",
+      "SY-highlight-roundtrip": "pass"
+    },
+    "timings_ms": {
+      "setup": 59,
+      "pass_a1": 29,
+      "pass_b1": 10,
+      "pass_b2": 20,
+      "pass_a2": 7
+    },
+    "file_counts": {
+      "after_setup": 7,
+      "after_pass_b1": 15,
+      "after_pass_a2": 18
+    },
+    "upload_probe": {
+      "total_files": 18,
+      "uploaded_files": 18,
+      "pending_files": 0,
+      "has_conflicts": false,
+      "hidden_or_extra_files": [],
+      "xattrs": ["com.apple.provenance"],
+      "note": "All 18 files already reported ubiquitousItemIsUploaded=true on first poll (~8 s after pass_a2 finished)."
+    },
+    "eviction_and_disk_read": {
+      "evicted_targets": 11,
+      "evict_errors": 0,
+      "all_dataless_after_evict": true,
+      "disk_read_total_seconds": 16.04,
+      "non_evicted_files_ms": [0, 0, 0],
+      "evicted_files_ms": {
+        "min": 996,
+        "median": 1547,
+        "max": 2361,
+        "per_file": [
+          { "kind": "device", "size": 1265, "ms": 2361 },
+          { "kind": "device", "size": 1265, "ms": 1032 },
+          { "kind": "blob", "size": 83, "ms": 1623 },
+          { "kind": "blob", "size": 20, "ms": 1705 },
+          { "kind": "blob", "size": 738, "ms": 1141 },
+          { "kind": "blob", "size": 2, "ms": 1547 },
+          { "kind": "blob", "size": 22, "ms": 1001 },
+          { "kind": "change", "size": 1856, "ms": 996 },
+          { "kind": "change", "size": 1008, "ms": 1603 },
+          { "kind": "change", "size": 1032, "ms": 1031 },
+          { "kind": "change", "size": 608, "ms": 1983 }
+        ]
+      }
+    },
+    "cleanup": {
+      "removed": true,
+      "elapsed_seconds": 0.003
+    }
+  },
+  "google_drive": {
+    "root": "~/Library/CloudStorage/GoogleDrive-<account>/My Drive/Linen-spike",
+    "criteria": {
+      "SY-nothing-without-setup": "pass",
+      "SY-place-resume": "pass",
+      "SY-highlight-roundtrip": "pass"
+    },
+    "timings_ms": {
+      "setup": 57,
+      "pass_a1": 27,
+      "pass_b1": 8,
+      "pass_b2": 17,
+      "pass_a2": 7
+    },
+    "file_counts": {
+      "after_setup": 7,
+      "after_pass_b1": 15,
+      "after_pass_a2": 18
+    },
+    "upload_probe": {
+      "total_files": 18,
+      "uploaded_files": 18,
+      "pending_files": 0,
+      "has_conflicts": false,
+      "hidden_or_extra_files": [],
+      "xattrs": [
+        "com.apple.lastuseddate#PS",
+        "com.apple.provenance",
+        "com.google.drivefs.item-id#S"
+      ],
+      "nested_changes_lag_seconds": 2.78,
+      "note": "14 files (libraries/, trust/, enroll/, devices/, blobs/) were already uploaded on first poll; the 4 files inside newly created changes/<device>/ subdirectories finished uploading 2.78 s later."
+    },
+    "eviction_and_disk_read": {
+      "evicted_targets": 11,
+      "evict_errors": 0,
+      "all_dataless_after_evict": true,
+      "disk_read_total_seconds": 16.4,
+      "non_evicted_files_ms": [0, 0, 0],
+      "evicted_files_ms": {
+        "min": 998,
+        "median": 1238,
+        "max": 2456,
+        "per_file": [
+          { "kind": "device", "size": 1265, "ms": 2059 },
+          { "kind": "device", "size": 1265, "ms": 1848 },
+          { "kind": "blob", "size": 83, "ms": 1491 },
+          { "kind": "blob", "size": 2, "ms": 1231 },
+          { "kind": "blob", "size": 20, "ms": 1062 },
+          { "kind": "blob", "size": 22, "ms": 1043 },
+          { "kind": "blob", "size": 738, "ms": 999 },
+          { "kind": "change", "size": 1856, "ms": 998 },
+          { "kind": "change", "size": 1008, "ms": 1962 },
+          { "kind": "change", "size": 1032, "ms": 1238 },
+          { "kind": "change", "size": 608, "ms": 2456 }
+        ]
+      }
+    },
+    "cleanup": {
+      "removed": true,
+      "elapsed_seconds": 0.003
+    }
+  }
+}

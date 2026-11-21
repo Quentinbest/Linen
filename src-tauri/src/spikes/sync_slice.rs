@@ -33,11 +33,71 @@ const STORAGE: &str = "b5-test-folder";
 #[derive(Default)]
 pub struct SyncSlice(Mutex<Option<Slice>>);
 
+struct ExternalCleanup(Option<PathBuf>);
+
+impl Drop for ExternalCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
 struct Slice {
     endpoints: [Endpoint; 2],
     shared: PathBuf,
+    external_shared: bool,
+    _cleanup: ExternalCleanup,
     _root: tempfile::TempDir,
     started: Instant,
+}
+
+/// SD3: an external shared folder must be named `Linen-spike` and must not already
+/// hold files, so B6 never touches the reader's own `Linen` folder or user data.
+fn prepare_external_shared(path: &Path) -> Result<PathBuf> {
+    if path.file_name().and_then(|name| name.to_str()) != Some("Linen-spike") {
+        return Err("LINEN_SYNC_SPIKE_DIR must end with Linen-spike".into());
+    }
+    if path.exists() {
+        let mut entries = fs::read_dir(path)?;
+        if entries.next().is_some() {
+            return Err("Linen-spike already exists and is not empty".into());
+        }
+    } else {
+        fs::create_dir(path)?;
+    }
+    Ok(path.to_path_buf())
+}
+
+fn list_shared(root: &Path) -> Result<Vec<Value>> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<Value>) -> Result<()> {
+        let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let meta = fs::symlink_metadata(&path)?;
+            if meta.is_dir() {
+                walk(base, &path, out)?;
+            } else {
+                out.push(json!({
+                    "path": rel,
+                    "size": meta.len(),
+                    "symlink": meta.file_type().is_symlink(),
+                }));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    if root.exists() {
+        walk(root, root, &mut out)?;
+    }
+    Ok(out)
 }
 
 struct Endpoint {
@@ -157,10 +217,17 @@ fn exchange(folder: &mut Disk, path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 impl Slice {
-    fn setup(source: &Path) -> Result<Self> {
+    fn setup(source: &Path, external: Option<&Path>, keep_external: bool) -> Result<Self> {
         let root = tempfile::Builder::new().prefix("linen-b5-").tempdir()?;
-        let shared = root.path().join("shared");
-        fs::create_dir(&shared)?;
+        let (shared, external_shared) = match external {
+            Some(path) => (prepare_external_shared(path)?, true),
+            None => {
+                let shared = root.path().join("shared");
+                fs::create_dir(&shared)?;
+                (shared, false)
+            }
+        };
+        let cleanup = ExternalCleanup((external_shared && !keep_external).then(|| shared.clone()));
         let mut folder = Disk::open(&shared)?;
         let id = Id16(crypto::random()?);
         let naming: [u8; 32] = crypto::random()?;
@@ -311,6 +378,8 @@ impl Slice {
         Ok(Self {
             endpoints,
             shared,
+            external_shared,
+            _cleanup: cleanup,
             _root: root,
             started: Instant::now(),
         })
@@ -336,6 +405,7 @@ pub enum Action {
     Read {
         side: usize,
     },
+    Inspect,
     Reset,
 }
 
@@ -352,8 +422,17 @@ fn apply(
     };
     match action {
         Action::Setup => {
-            *session = Some(setup()?);
-            return Ok(json!({"configured": true}));
+            let started = Instant::now();
+            let slice = setup()?;
+            let files = list_shared(&slice.shared)?;
+            let external = slice.external_shared;
+            *session = Some(slice);
+            return Ok(json!({
+                "configured": true,
+                "external": external,
+                "durationMs": started.elapsed().as_millis() as u64,
+                "files": files,
+            }));
         }
         Action::Reset => {
             *session = None;
@@ -368,8 +447,15 @@ fn apply(
     match action {
         Action::Pass { side } => {
             endpoint(slice, side)?;
+            let started = Instant::now();
             slice.endpoints[side].pass(&slice.shared, slice.started)?;
-            Ok(json!({"configured": true}))
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let files = list_shared(&slice.shared)?;
+            Ok(json!({
+                "configured": true,
+                "durationMs": duration_ms,
+                "files": files,
+            }))
         }
         Action::Save {
             cfi,
@@ -418,6 +504,11 @@ fn apply(
                 "annotations": store.annotations(&device.book)?}),
             )
         }
+        Action::Inspect => Ok(json!({
+            "configured": true,
+            "external": slice.external_shared,
+            "files": list_shared(&slice.shared)?,
+        })),
         Action::Setup | Action::Reset => unreachable!(),
     }
 }
@@ -428,8 +519,14 @@ pub fn spike_sync_slice(
     action: Action,
 ) -> std::result::Result<Value, String> {
     let mut session = state.0.lock().map_err(|_| "test sync lock poisoned")?;
+    let external = std::env::var_os("LINEN_SYNC_SPIKE_DIR").map(PathBuf::from);
+    let keep = std::env::var_os("LINEN_SYNC_SPIKE_KEEP").is_some_and(|v| v == "1");
     apply(&mut session, action, || {
-        Slice::setup(&super::repo_root().join("corpus/cache").join(BOOK))
+        Slice::setup(
+            &super::repo_root().join("corpus/cache").join(BOOK),
+            external.as_deref(),
+            keep,
+        )
     })
     .map_err(|e| e.to_string())
 }
@@ -452,9 +549,43 @@ mod tests {
     }
 
     #[test]
+    fn external_dir_must_be_named_linen_spike_and_cleans_up_on_drop() {
+        let parent = tempfile::tempdir().unwrap();
+        let bad = parent.path().join("Linen");
+        assert!(prepare_external_shared(&bad).is_err());
+        assert!(!bad.exists());
+
+        let spike_dir = parent.path().join("Linen-spike");
+        let epub = super::super::repo_root().join("corpus/cache").join(BOOK);
+        if !epub.is_file() {
+            return;
+        }
+        let slice = Slice::setup(&epub, Some(&spike_dir), false).unwrap();
+        assert!(spike_dir.is_dir());
+        assert!(!list_shared(&spike_dir).unwrap().is_empty());
+        drop(slice);
+        assert!(!spike_dir.exists());
+    }
+
+    #[test]
+    fn external_dir_is_cleaned_up_when_setup_fails() {
+        let parent = tempfile::tempdir().unwrap();
+        let spike_dir = parent.path().join("Linen-spike");
+        let missing_epub = parent.path().join("missing.epub");
+        assert!(Slice::setup(&missing_epub, Some(&spike_dir), false).is_err());
+        assert!(!spike_dir.exists());
+    }
+
+    #[test]
     fn the_two_disk_libraries_exchange_place_and_note() {
-        let mut session =
-            Some(Slice::setup(&super::super::repo_root().join("corpus/cache").join(BOOK)).unwrap());
+        let mut session = Some(
+            Slice::setup(
+                &super::super::repo_root().join("corpus/cache").join(BOOK),
+                None,
+                false,
+            )
+            .unwrap(),
+        );
         let mut run = |action| apply(&mut session, action, || unreachable!()).unwrap();
         let cfi = "epubcfi(/6/4!/4/2/1:0)";
         run(Action::Save {
@@ -477,5 +608,76 @@ mod tests {
             run(Action::Read { side: 0 })["annotations"][0]["note"],
             "edited in B"
         );
+    }
+
+    #[test]
+    fn disk_reads_external_spike_dir_when_requested() {
+        let Some(dir) = std::env::var_os("LINEN_SYNC_EVICT_DIR").map(PathBuf::from) else {
+            return;
+        };
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some("Linen-spike"),
+            "SD3: refusing non Linen-spike dir"
+        );
+        let folder = Disk::open(&dir).expect("open Disk");
+        let mut results = Vec::new();
+        for top in ["devices", "blobs", "trust", "libraries"] {
+            let page = folder.list(top, None).expect("list");
+            for entry in page.entries {
+                let t0 = Instant::now();
+                let size = folder.stat(&entry.token).expect("stat");
+                let read = folder
+                    .read(&entry.token, Some(16 * 1024 * 1024))
+                    .expect("read");
+                let ms = t0.elapsed().as_millis() as u64;
+                let len = match read {
+                    crate::sync::folder::Read::Bytes(b) => Some(b.len()),
+                    _ => None,
+                };
+                results.push(json!({
+                    "name": entry.name,
+                    "statSize": size,
+                    "readBytes": len,
+                    "durationMs": ms,
+                }));
+            }
+        }
+        if let Ok(changes_dir) = fs::read_dir(dir.join("changes")) {
+            for dev in changes_dir.flatten() {
+                let Some(dev_name) = dev.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if dev_name.starts_with('.') {
+                    continue;
+                }
+                let sub = format!("changes/{dev_name}");
+                let page = folder.list(&sub, None).expect("list changes");
+                for entry in page.entries {
+                    let t0 = Instant::now();
+                    let size = folder.stat(&entry.token).expect("stat");
+                    let read = folder
+                        .read(&entry.token, Some(16 * 1024 * 1024))
+                        .expect("read");
+                    let ms = t0.elapsed().as_millis() as u64;
+                    let len = match read {
+                        crate::sync::folder::Read::Bytes(b) => Some(b.len()),
+                        _ => None,
+                    };
+                    results.push(json!({
+                        "name": entry.name,
+                        "statSize": size,
+                        "readBytes": len,
+                        "durationMs": ms,
+                    }));
+                }
+            }
+        }
+        println!(
+            "DISK_EVICT_JSON:{}",
+            serde_json::to_string(&results).unwrap()
+        );
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| r["readBytes"].is_number()));
     }
 }

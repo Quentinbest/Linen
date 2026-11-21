@@ -1,6 +1,6 @@
 # Sync, the road to a release — revised plan
 
-Status: drafted 2026-11-12 from the progress review of 2026-11-11. The owner approved items 121–125 the same day, each as recommended (`docs/decisions.md`), so SD2–SD10 stand as written. A stage is still built only when the owner labels or names it, and each run in a real storage folder still waits for the owner's agreement (SD3).
+Status: drafted 2026-11-12 from the progress review of 2026-11-11. The owner approved items 121–125 the same day, each as recommended (`docs/decisions.md`), so SD2–SD10 stand as written. **Updated 2026-11-21 (SD6 gate):** Parts A and B (`B1`–`B6`) are complete (`docs/spikes/sync-slice.md`), and the owner chose to **park sync** rather than proceed to Part C (`docs/decisions.md`). `src-tauri/src/sync/` stays dormant (PS8), and no Part C stage is labelled.
 
 This plan changes the **order** in which sync is built and the **gates** on the way. It adds no protocol rule and removes no check:
 

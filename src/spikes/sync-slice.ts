@@ -4,8 +4,17 @@ import { openView, painted, type Criterion, type SpikeResult } from './common'
 
 const BOOK = 'standardebooks-moby-dick.epub'
 
+interface SharedFile {
+  path: string
+  size: number
+  symlink: boolean
+}
+
 interface Snapshot {
   configured: boolean
+  external?: boolean
+  durationMs?: number
+  files?: SharedFile[]
   position?: [string, number] | null
   annotations?: { id: string; cfi_range: string; quote_exact: string; note: string | null }[]
 }
@@ -16,6 +25,7 @@ function call(action: { kind: string } & Record<string, unknown>): Promise<Snaps
 
 export async function spikeSync(): Promise<SpikeResult> {
   const criteria: Criterion[] = []
+  const raw: Record<string, unknown> = {}
   const check = (id: string, description: string, ok: boolean, evidence: string) => {
     criteria.push({ id, description, verdict: ok ? 'pass' : 'fail', evidence })
   }
@@ -28,7 +38,10 @@ export async function spikeSync(): Promise<SpikeResult> {
     'Both passes returned unconfigured before either root was created.',
   )
   try {
-    await call({ kind: 'setup' })
+    const setup = await call({ kind: 'setup' })
+    raw.external = setup.external ?? false
+    raw.setupMs = setup.durationMs
+    raw.filesAfterSetup = setup.files
     const { view } = await openView(BOOK)
     await painted()
     const start = view.lastLocation?.cfi
@@ -63,8 +76,11 @@ export async function spikeSync(): Promise<SpikeResult> {
     })
     const initial = (await call({ kind: 'read', side: 0 })).annotations?.[0]
     view.close()
-    await call({ kind: 'pass', side: 0 })
-    await call({ kind: 'pass', side: 1 })
+    const passA1 = await call({ kind: 'pass', side: 0 })
+    const passB1 = await call({ kind: 'pass', side: 1 })
+    raw.passA1Ms = passA1.durationMs
+    raw.passB1Ms = passB1.durationMs
+    raw.filesAfterPassB1 = passB1.files
     const received = await call({ kind: 'read', side: 1 })
     const cfi = received.position?.[0]
     const { view: resumed } = await openView(BOOK, { lastLocation: cfi })
@@ -87,8 +103,11 @@ export async function spikeSync(): Promise<SpikeResult> {
     )
     resumed.close()
     await call({ kind: 'edit', note: 'edited in B' })
-    await call({ kind: 'pass', side: 1 })
-    await call({ kind: 'pass', side: 0 })
+    const passB2 = await call({ kind: 'pass', side: 1 })
+    const passA2 = await call({ kind: 'pass', side: 0 })
+    raw.passB2Ms = passB2.durationMs
+    raw.passA2Ms = passA2.durationMs
+    raw.filesAfterPassA2 = passA2.files
     const roundTrip = (await call({ kind: 'read', side: 0 })).annotations?.[0]
     check(
       'SY-highlight-roundtrip',
@@ -105,5 +124,5 @@ export async function spikeSync(): Promise<SpikeResult> {
   } finally {
     await call({ kind: 'reset' })
   }
-  return { spike: 'sync', criteria, raw: {} }
+  return { spike: 'sync', criteria, raw }
 }
