@@ -79,11 +79,44 @@ pub fn init<R: Runtime>(app: &tauri::App<R>) -> Result<AppState, Box<dyn std::er
     let mut store = Store::open(&root.join("linen.db"))?;
     let library = Library::new(&root)?;
     purge_removed(&mut store, &library);
+    refresh_existing_book_damage(&mut store, &library);
     Ok(AppState {
         store: Mutex::new(store),
         library,
         open_book: Mutex::new(None),
     })
+}
+
+/// Plan §7.1, E3, #87: backfill `too-large` `book_damage` rows once for books imported
+/// before the 16 MiB text-entry cap, so the library shows the E3 damaged-book card
+/// and Contents marks the unavailable chapter.
+pub fn refresh_existing_book_damage(store: &mut Store, library: &Library) {
+    const FLAG: &str = "textCapChecked:16m";
+    if store.setting(FLAG).ok().flatten().as_deref() == Some("1") {
+        return;
+    }
+    let Ok(books) = store.books() else {
+        return;
+    };
+    for book in books {
+        let Some(path) = library.book_file(&book.file_path) else {
+            continue;
+        };
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let Ok(mut archive) = zip::ZipArchive::new(file) else {
+            continue;
+        };
+        let oversized = crate::epub::oversized_text_spine_entries(&mut archive);
+        for href in oversized {
+            let _ = store.conn().execute(
+                "INSERT OR IGNORE INTO book_damage (book_id, item_href, error_kind) VALUES (?1, ?2, 'too-large')",
+                rusqlite::params![book.id, href],
+            );
+        }
+    }
+    let _ = store.set_setting(FLAG, "1");
 }
 
 /// G4 (provisional): books removed in an earlier session go for good at launch,
@@ -223,32 +256,51 @@ pub fn book_entries(state: State<AppState>, book_id: String) -> CmdResult<Vec<(S
     })
 }
 
-/// L17: one entry of the open book, read from the zip on demand.
+/// L17, §7.1, #87: one entry of the open book, read from the zip on demand.
+/// Text/markup entries (or any read marked `text`) are capped at `MAX_TEXT_ENTRY_BYTES`
+/// before reading so a single oversized chapter cannot blow the 400 MB memory budget.
 #[tauri::command]
 pub fn book_entry(
     state: State<AppState>,
     book_id: String,
     name: String,
+    text: Option<bool>,
 ) -> CmdResult<tauri::ipc::Response> {
+    let limit = entry_limit(&name, text.unwrap_or(false));
     with_open_book(&state, &book_id, |archive| {
-        read_entry(archive, &name).map(tauri::ipc::Response::new)
+        read_entry(archive, &name, limit).map(tauri::ipc::Response::new)
     })
 }
 
-/// One entry's bytes, capped at MAX_ENTRY_BYTES.
-fn read_entry(archive: &mut zip::ZipArchive<std::fs::File>, name: &str) -> CmdResult<Vec<u8>> {
+fn entry_limit(name: &str, text: bool) -> u64 {
+    if text || crate::epub::is_text_entry(name) {
+        crate::epub::MAX_TEXT_ENTRY_BYTES
+    } else {
+        MAX_ENTRY_BYTES
+    }
+}
+
+/// One entry's bytes, checked against `limit` both before allocating and while decompressing.
+fn read_entry<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+    limit: u64,
+) -> CmdResult<Vec<u8>> {
     use std::io::Read;
     let failed = |e: String| CommandError::Failed { message: e };
     let entry =
         crate::epub::by_decoded_name(archive, name).map_err(|e| failed(format!("{name}: {e}")))?;
-    if entry.size() > MAX_ENTRY_BYTES {
+    if entry.size() > limit {
         return Err(failed(format!("{name} is too large")));
     }
     let mut bytes = Vec::with_capacity(entry.size() as usize);
     entry
-        .take(MAX_ENTRY_BYTES)
+        .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|e| failed(e.to_string()))?;
+    if bytes.len() as u64 > limit {
+        return Err(failed(format!("{name} is too large")));
+    }
     Ok(bytes)
 }
 
@@ -340,7 +392,7 @@ pub fn serve_book_media(
     if *open_id != book_id {
         return reply(StatusCode::NOT_FOUND);
     }
-    match read_entry(archive, &entry) {
+    match read_entry(archive, &entry, MAX_ENTRY_BYTES) {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", mime)
@@ -659,13 +711,30 @@ pub fn annotation_restore(state: State<AppState>, id: String) -> CmdResult<()> {
     Ok(state.store.lock().unwrap().restore_annotation(&id)?)
 }
 
-/// E3, N6: the book's damaged spine items (zip paths), recorded at import.
+/// E3, N6, #87: the book's damaged spine items (zip paths), recorded at import or
+/// backfilled from the open archive when an existing book predates the text-entry cap.
 #[tauri::command]
 pub fn book_damage(state: State<AppState>, book_id: String) -> CmdResult<Vec<String>> {
     let failed = |e: rusqlite::Error| CommandError::Failed {
         message: e.to_string(),
     };
+    // Lock `open_book` before `store` (same order as `with_open_book`, never nested the other way).
+    let oversized = {
+        let mut open = state.open_book.lock().unwrap();
+        match open.as_mut() {
+            Some((id, archive)) if id == &book_id => {
+                crate::epub::oversized_text_spine_entries(archive)
+            }
+            _ => Vec::new(),
+        }
+    };
     let store = state.store.lock().unwrap();
+    for href in oversized {
+        let _ = store.conn().execute(
+            "INSERT OR IGNORE INTO book_damage (book_id, item_href, error_kind) VALUES (?1, ?2, 'too-large')",
+            rusqlite::params![&book_id, href],
+        );
+    }
     let mut stmt = store
         .conn()
         .prepare("SELECT item_href FROM book_damage WHERE book_id = ?1 ORDER BY item_href")
@@ -1181,7 +1250,9 @@ mod quit_tests {
 
 #[cfg(test)]
 mod book_scheme_tests {
-    use super::{media_type, parse_book_path};
+    use super::{entry_limit, media_type, parse_book_path, read_entry, MAX_ENTRY_BYTES};
+    use crate::epub::MAX_TEXT_ENTRY_BYTES;
+    use std::io::{Cursor, Write};
 
     #[test]
     fn serves_only_media_types() {
@@ -1204,5 +1275,115 @@ mod book_scheme_tests {
         );
         assert_eq!(parse_book_path("/abc123"), None);
         assert_eq!(parse_book_path("/abc/%zz.png"), None);
+    }
+
+    #[test]
+    fn entry_limit_caps_text_and_keeps_media_limit() {
+        for name in ["c.xhtml", "c.HTML", "s.css", "i.svg", "toc.ncx", "a.xml"] {
+            assert_eq!(entry_limit(name, false), MAX_TEXT_ENTRY_BYTES, "{name}");
+        }
+        assert_eq!(
+            entry_limit("chapter_without_ext", true),
+            MAX_TEXT_ENTRY_BYTES
+        );
+        assert_eq!(entry_limit("OEBPS/plate.png", false), MAX_ENTRY_BYTES);
+        assert_eq!(entry_limit("OEBPS/font.woff2", false), MAX_ENTRY_BYTES);
+    }
+
+    #[test]
+    fn read_entry_refuses_oversized_text_entry_and_enforces_stream_cap() {
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("OEBPS/small.xhtml", stored).unwrap();
+            zw.write_all(b"<p>hello</p>").unwrap();
+            zw.start_file("OEBPS/huge.xhtml", stored).unwrap();
+            zw.write_all(&vec![b'x'; MAX_TEXT_ENTRY_BYTES as usize + 1])
+                .unwrap();
+            zw.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf)).unwrap();
+        assert_eq!(
+            read_entry(
+                &mut archive,
+                "OEBPS/small.xhtml",
+                entry_limit("OEBPS/small.xhtml", true)
+            )
+            .unwrap(),
+            b"<p>hello</p>"
+        );
+        assert!(read_entry(
+            &mut archive,
+            "OEBPS/huge.xhtml",
+            entry_limit("OEBPS/huge.xhtml", false),
+        )
+        .is_err());
+        // Exact boundary passes; one byte under refuses.
+        assert!(read_entry(&mut archive, "OEBPS/small.xhtml", 12).is_ok());
+        assert!(read_entry(&mut archive, "OEBPS/small.xhtml", 11).is_err());
+    }
+
+    #[test]
+    fn refresh_existing_book_damage_backfills_pre_cap_books() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = crate::import::Library::new(tmp.path()).unwrap();
+        let mut store = crate::store::Store::open(&tmp.path().join("linen.db")).unwrap();
+
+        // Build an EPUB with one normal chapter and one >16 MiB chapter, stored directly
+        // as a pre-#87 library book without any `book_damage` rows.
+        let epub_path = lib.books_dir.join("precap-1234567890ab.epub");
+        {
+            let file = std::fs::File::create(&epub_path).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let container = br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#;
+            let opf = br#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>PreCap</dc:title></metadata><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#;
+            let mut huge = b"<!DOCTYPE html><html><body><p>".to_vec();
+            huge.resize(MAX_TEXT_ENTRY_BYTES as usize + 1, b'a');
+            for (name, data) in [
+                ("META-INF/container.xml", container.as_slice()),
+                ("OEBPS/content.opf", opf.as_slice()),
+                (
+                    "OEBPS/c1.xhtml",
+                    b"<html><body><p>ok</p></body></html>".as_slice(),
+                ),
+                ("OEBPS/c2.xhtml", huge.as_slice()),
+            ] {
+                zw.start_file(name, stored).unwrap();
+                zw.write_all(data).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+
+        store
+            .conn()
+            .execute(
+                "INSERT INTO books (id, content_hash, file_path, title, title_source, authors,
+                     page_direction, layout, has_page_list, a11y_metadata, added_at)
+                 VALUES ('b1', 'hash1', ?1, 'PreCap', 'opf', '[]', 'default', 'reflowable', 0, '[]', 1)",
+                [epub_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        assert_eq!(store.books().unwrap()[0].damaged_items, 0);
+
+        super::refresh_existing_book_damage(&mut store, &lib);
+
+        assert_eq!(store.books().unwrap()[0].damaged_items, 1);
+        let row: (String, String) = store
+            .conn()
+            .query_row(
+                "SELECT item_href, error_kind FROM book_damage WHERE book_id = 'b1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("OEBPS/c2.xhtml".into(), "too-large".into()));
+        assert_eq!(
+            store.setting("textCapChecked:16m").unwrap().as_deref(),
+            Some("1")
+        );
     }
 }

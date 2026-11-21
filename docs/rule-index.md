@@ -49,7 +49,7 @@ Look up one rule with its code and e2e checks: `python3 scripts/rule-index.py S9
 | D7 | L785 | Item: Minimum OS versions; Decide by: Decided 2026-09-24: macOS 13+, Windows 10 22H2+ (evergreen WebView2), U… | Signed off 2026-09-24 (found during Phase 0–1 work) |
 | E1 | L240 | EPUB 2 and 3: navigation document first, NCX as fallback; EPUB 3 landmarks, page-list and noteref semantics u… |  |
 | E2 | L241 | Basic fixed layout: pages scaled to fit, spreads per rendition:spread, zoom by pinch and ⌘+; typography contr… |  |
-| E3 | L242 | Corrupted book: validate on import, tolerate damaged entries. Error card: “Part of this book couldn’t be open… | Approved 2026-09-25 (Phases 3–6 review) |
+| E3 | L242 | Corrupted book: validate on import, tolerate damaged entries. Error card: “Part of this book couldn’t be open… | Decision record<br>Approved 2026-09-25 (Phases 3–6 review) |
 | E4 | L243 | Missing metadata: title from the first heading or the file name; generated typographic cover with a tint deri… |  |
 | E5 | L244 | Save failure: write-ahead log, atomic writes; “Couldn’t save notes to disk · Retry”; nothing discarded |  |
 | E6 | L245 | Library: Continue reading (the current book large, the next two small, last-opened time); All books cover gri… |  |
