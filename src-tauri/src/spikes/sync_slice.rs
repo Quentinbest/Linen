@@ -33,21 +33,23 @@ const STORAGE: &str = "b5-test-folder";
 #[derive(Default)]
 pub struct SyncSlice(Mutex<Option<Slice>>);
 
+struct ExternalCleanup(Option<PathBuf>);
+
+impl Drop for ExternalCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
 struct Slice {
     endpoints: [Endpoint; 2],
     shared: PathBuf,
     external_shared: bool,
-    keep_external: bool,
+    _cleanup: ExternalCleanup,
     _root: tempfile::TempDir,
     started: Instant,
-}
-
-impl Drop for Slice {
-    fn drop(&mut self) {
-        if self.external_shared && !self.keep_external {
-            let _ = fs::remove_dir_all(&self.shared);
-        }
-    }
 }
 
 /// SD3: an external shared folder must be named `Linen-spike` and must not already
@@ -225,6 +227,7 @@ impl Slice {
                 (shared, false)
             }
         };
+        let cleanup = ExternalCleanup((external_shared && !keep_external).then(|| shared.clone()));
         let mut folder = Disk::open(&shared)?;
         let id = Id16(crypto::random()?);
         let naming: [u8; 32] = crypto::random()?;
@@ -376,7 +379,7 @@ impl Slice {
             endpoints,
             shared,
             external_shared,
-            keep_external,
+            _cleanup: cleanup,
             _root: root,
             started: Instant::now(),
         })
@@ -561,6 +564,15 @@ mod tests {
         assert!(spike_dir.is_dir());
         assert!(!list_shared(&spike_dir).unwrap().is_empty());
         drop(slice);
+        assert!(!spike_dir.exists());
+    }
+
+    #[test]
+    fn external_dir_is_cleaned_up_when_setup_fails() {
+        let parent = tempfile::tempdir().unwrap();
+        let spike_dir = parent.path().join("Linen-spike");
+        let missing_epub = parent.path().join("missing.epub");
+        assert!(Slice::setup(&missing_epub, Some(&spike_dir), false).is_err());
         assert!(!spike_dir.exists());
     }
 
