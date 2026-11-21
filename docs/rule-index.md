@@ -26,7 +26,7 @@ Look up one rule with its code and e2e checks: `python3 scripts/rule-index.py S9
 | B3 | L735 | Item: Import semantics. The design fixes “copied into your library” (Screen 12). Still open: library folder l… | Decision record<br>Signed off 2026-09-24 (found during Phase 0–1 work) |
 | B4 | L736 | Item: Highlight edge cases: overlapping or nested highlights, highlights spanning chapters, maximum length, w… | Recommended defaults adopted 2026-09-24 |
 | B5 | L737 | Item: Undo scope: only deletions (as drawn), or also colour changes and note edits?; Decide by: Phase 5 start | Recommended defaults adopted 2026-09-24 |
-| B6 | L738 | Item: Search limits: result caps for very common words. Regex and whole-word matching are deferred (P§7); dec… | Recommended defaults adopted 2026-09-24<br>Approved 2026-10-01 (release 1.1, and item 31) |
+| B6 | L738 | Item: Search limits: result caps for very common words. Regex and whole-word matching are deferred (P§7); dec… | Decision record<br>Recommended defaults adopted 2026-09-24<br>Approved 2026-10-01 (release 1.1, and item 31) |
 | B7 | L739 | Item: Multiple windows or books open at once. The design shows one reader; recommend one book per window, wit… | Decision record<br>Recommended defaults adopted 2026-09-24 |
 | B8 | L740 | Item: Scroll mode: continuous across chapters or per chapter; what the location line and scrubber show.; Deci… | Recommended defaults adopted 2026-09-24 |
 | B9 | L741 | Item: DRM-protected files: detection and messaging (DRM is out of scope, but such files will be opened).; Dec… | Recommended defaults adopted 2026-09-24 |
