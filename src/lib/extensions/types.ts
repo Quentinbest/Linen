@@ -55,3 +55,52 @@ export interface Inspection {
   new_permissions: string[]
   incompatible: string | null
 }
+
+export type CatalogCategory = 'lookup' | 'theme' | 'export' | 'navigation' | 'utility'
+
+export interface CatalogEntry {
+  id: string
+  name: string
+  summary: string
+  publisher: string
+  homepage: string
+  category: CatalogCategory
+  version: string
+  enginesLinen: string
+  downloadUrl: string
+  sha256: string
+  sizeBytes: number
+  permissions: string[]
+  optionalPermissions: string[]
+  contributesSummary: string[]
+}
+
+export type EntryInstallState =
+  | { kind: 'notInstalled' }
+  | { kind: 'installedCurrent' }
+  | { kind: 'updateAvailable'; installedVersion: string }
+  | { kind: 'incompatible'; reason: string }
+
+export interface CatalogEntryView {
+  entry: CatalogEntry
+  state: EntryInstallState
+}
+
+export interface CatalogResponse {
+  entries: CatalogEntryView[]
+  fetchedAt: number
+  offline: boolean
+  stale: boolean
+}
+
+export interface StagedInspection {
+  token: string
+  inspection: Inspection
+}
+
+export type CatalogRowState =
+  | { kind: 'idle' }
+  | { kind: 'downloading' }
+  | { kind: 'confirming'; token: string }
+  | { kind: 'installing' }
+  | { kind: 'failed'; reason: string }
