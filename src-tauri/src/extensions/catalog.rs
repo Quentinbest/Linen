@@ -13,10 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-// PROVISIONAL: catalog endpoint and signing key until the catalog repository is published.
-const DEFAULT_CATALOG_URL: &str = "https://extensions.linen.app/catalog/v1/catalog.json";
-// PROVISIONAL: placeholder Minisign public key until the release signing key is provisioned.
-const DEFAULT_CATALOG_PUBKEY: &str = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+const DEFAULT_CATALOG_URL: &str = "https://quentinbest.github.io/Linen/catalog/v1/catalog.json";
+const DEFAULT_CATALOG_PUBKEY: &str = "RWQOhCovg1549pI9XQ5r72o8lwu8Lx3vpoBAycCNHNyhe+usCpewG5ZC";
 
 const SCHEMA_VERSION: u32 = 1;
 const CACHE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
