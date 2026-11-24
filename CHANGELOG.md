@@ -2,6 +2,15 @@
 
 Every Linen release, newest first. Each entry is the summary that goes into the release's notes on GitHub; the release workflow copies it from here (see `.github/workflows/release.yml`).
 
+## v0.6.0 — 2026-11-24
+
+Linen 0.6.0 adds an in-app extension catalog so you can browse and install extensions without downloading `.linenext` files by hand.
+
+- **Extension catalog:** Open **Settings › Extensions** and switch to **Browse** to search, filter, download, and install extensions from Linen's signed static catalog (`https://quentinbest.github.io/Linen/catalog/v1/catalog.json`). Linen verifies the catalog signature and each package checksum before install, falls back to the saved catalog when you are offline, and shows the same permission consent sheet used for local `.linenext` installs.
+- **Security updates:** Updated `cookie`, `url`, and `rustix` for known RustSec advisories.
+
+**Translations:** the new Browse text in Spanish, Japanese, Simplified Chinese, and Traditional Chinese is a draft, still to be reviewed by native speakers.
+
 ## v0.5.3 — 2026-11-14
 
 Linen 0.5.3 is a maintenance release. Nothing about reading changes. It is 0.5.2, which was not published, with one more security update.
