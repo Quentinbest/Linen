@@ -5,6 +5,9 @@
 //! is keyed by the extension id and capped.
 
 use crate::commands::{AppState, CommandError};
+use crate::extensions::catalog::{
+    self, CatalogError, CatalogResponse, CatalogStaging, StagedInspection,
+};
 use crate::extensions::manifest::Manifest;
 use crate::extensions::registry::{self, ExtError, FetchResponse, Inspection, Installed};
 use std::path::PathBuf;
@@ -15,6 +18,14 @@ type CmdResult<T> = Result<T, CommandError>;
 
 impl From<ExtError> for CommandError {
     fn from(e: ExtError) -> Self {
+        CommandError::Failed {
+            message: e.to_string(),
+        }
+    }
+}
+
+impl From<CatalogError> for CommandError {
+    fn from(e: CatalogError) -> Self {
         CommandError::Failed {
             message: e.to_string(),
         }
@@ -433,4 +444,75 @@ pub fn launch_in_safe_mode(state: &AppState) -> bool {
         let _ = store.set_setting("safeModeOnce", "0");
     }
     once || std::env::var("LINEN_SAFE_MODE").as_deref() == Ok("1") || crate::native::shift_held()
+}
+
+// ---------------------------------------------------------------- Extension catalog
+
+#[tauri::command]
+pub async fn extension_catalog_list(
+    state: State<'_, AppState>,
+    force: bool,
+) -> CmdResult<CatalogResponse> {
+    let cache = catalog::read_cache(&state.store.lock().unwrap())?;
+    let url = catalog::catalog_url();
+    let pubkey = catalog::catalog_pubkey();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        catalog::fetch_catalog_network(cache, force, &url, &pubkey)
+    })
+    .await
+    .map_err(|e| CommandError::Failed {
+        message: e.to_string(),
+    })??;
+    let mut store = state.store.lock().unwrap();
+    let installed = registry::list(&store, &state.library.extensions_dir)?;
+    Ok(catalog::apply_fetch_outcome(
+        &mut store, &installed, outcome,
+    )?)
+}
+
+#[tauri::command]
+pub async fn extension_catalog_stage(
+    state: State<'_, AppState>,
+    staging: State<'_, CatalogStaging>,
+    id: String,
+) -> CmdResult<StagedInspection> {
+    let entry = catalog::find_cached_entry(&state.store.lock().unwrap(), &id)?;
+    let ext_dir = state.library.extensions_dir.clone();
+    let entry_dl = entry.clone();
+    let staged_path = tauri::async_runtime::spawn_blocking(move || {
+        catalog::download_package(&ext_dir, &entry_dl)
+    })
+    .await
+    .map_err(|e| CommandError::Failed {
+        message: e.to_string(),
+    })??;
+    let staged = catalog::inspect_staged(&state.store.lock().unwrap(), staged_path, &entry)?;
+    Ok(staging.insert(staged))
+}
+
+#[tauri::command]
+pub fn extension_catalog_install(
+    state: State<AppState>,
+    staging: State<CatalogStaging>,
+    token: String,
+    granted: Vec<String>,
+) -> CmdResult<Manifest> {
+    let staged = staging.take(&token).ok_or(CatalogError::StagedNotFound)?;
+    let res = {
+        let mut store = state.store.lock().unwrap();
+        registry::install(
+            &mut store,
+            &state.library.extensions_dir,
+            &staged.path,
+            &granted,
+        )
+    };
+    let _ = std::fs::remove_file(&staged.path);
+    Ok(res?)
+}
+
+#[tauri::command]
+pub fn extension_catalog_discard(staging: State<CatalogStaging>, token: String) -> CmdResult<()> {
+    staging.discard(&token);
+    Ok(())
 }

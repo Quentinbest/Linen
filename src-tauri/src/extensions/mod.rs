@@ -7,6 +7,7 @@
 //! through the host (`net.fetch`, Phase 7). Extension UI pages (Navigator tabs,
 //! Phase 7) get their own locked-down CSP.
 
+pub mod catalog;
 pub mod manifest;
 pub mod registry;
 pub mod secrets;

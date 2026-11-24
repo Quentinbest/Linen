@@ -158,6 +158,10 @@ pub fn run() {
                 ext_commands::extension_secret_has,
                 ext_commands::extension_secret_delete,
                 ext_commands::extension_secret_request,
+                ext_commands::extension_catalog_list,
+                ext_commands::extension_catalog_stage,
+                ext_commands::extension_catalog_install,
+                ext_commands::extension_catalog_discard,
                 $($extra),*
             ]
         };
@@ -220,11 +224,13 @@ pub fn run() {
             ) {
                 log::error!("built-in extensions: {e}");
             }
+            extensions::catalog::cleanup_staging(&state.library.extensions_dir);
             // DX2: interrupted imports and replaced generations go at launch.
             let dicts = dictionaries::state::DictState::new(state.library.dictionaries_dir.clone());
             dictionaries::commands::recover(&state, &dicts);
             app.manage(dicts);
             app.manage(ext_commands::Vaults::for_app());
+            app.manage(extensions::catalog::CatalogStaging::default());
             app.manage(state);
             app.manage(ext_commands::SafeMode(std::sync::atomic::AtomicBool::new(
                 safe,
