@@ -50,6 +50,11 @@
   let optionsFor = $state<InstalledExtension | null>(null)
   /** The style kit's colours for an options page: the reader's theme. */
   let theme = $state<Theme>(THEMES.paper)
+  let installedTabEl = $state<HTMLButtonElement | null>(null)
+  let browseTabEl = $state<HTMLButtonElement | null>(null)
+  let destroyed = false
+  let catalogReqSeq = 0
+  let stagingSeq = 0
 
   const filteredCatalog = $derived(
     catalog ? filterCatalog(catalog.entries, { query, category, showIncompatible }) : [],
@@ -69,7 +74,10 @@
   /** Opened from the peek's “Open options” (settings.html#options=<id>, or an event). */
   export function openOptions(id: string) {
     const x = list.find((e) => e.manifest.id === id)
-    if (x?.manifest.contributes.options) optionsFor = x
+    if (x?.manifest.contributes.options) {
+      tab = 'installed'
+      optionsFor = x
+    }
   }
 
   async function reload() {
@@ -83,14 +91,20 @@
   }
 
   async function loadCatalog(force: boolean) {
+    const seq = ++catalogReqSeq
     catalogLoading = true
     catalogError = null
     try {
-      catalog = await invoke<CatalogResponse>('extension_catalog_list', { force })
+      const next = await invoke<CatalogResponse>('extension_catalog_list', { force })
+      if (destroyed || seq !== catalogReqSeq) return
+      catalog = next
     } catch (e) {
+      if (destroyed || seq !== catalogReqSeq) return
       catalogError = String((e as { message?: string }).message ?? e)
     } finally {
-      catalogLoading = false
+      if (!destroyed && seq === catalogReqSeq) {
+        catalogLoading = false
+      }
     }
   }
 
@@ -101,16 +115,47 @@
     }
   }
 
+  function onTabKeydown(e: KeyboardEvent) {
+    let next: 'installed' | 'browse' | null = null
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      next = tab === 'installed' ? 'browse' : 'installed'
+    } else if (e.key === 'Home') {
+      next = 'installed'
+    } else if (e.key === 'End') {
+      next = 'browse'
+    }
+    if (!next) return
+    e.preventDefault()
+    selectTab(next)
+    ;(next === 'installed' ? installedTabEl : browseTabEl)?.focus()
+  }
+
+  function discardCurrentSheetToken() {
+    const prev = sheet
+    if (prev?.catalogToken) {
+      void invoke('extension_catalog_discard', { token: prev.catalogToken })
+      if (prev.catalogId) setRowState(prev.catalogId, { kind: 'idle' })
+    }
+  }
+
   async function stageCatalogEntry(entry: CatalogEntry) {
+    const seq = ++stagingSeq
     setRowState(entry.id, { kind: 'downloading' })
     try {
       const staged = await invoke<StagedInspection>('extension_catalog_stage', { id: entry.id })
+      if (destroyed || seq !== stagingSeq) {
+        void invoke('extension_catalog_discard', { token: staged.token })
+        if (!destroyed) setRowState(entry.id, { kind: 'idle' })
+        return
+      }
       if (staged.inspection.incompatible) {
         await invoke('extension_catalog_discard', { token: staged.token })
+        if (destroyed) return
         setRowState(entry.id, { kind: 'failed', reason: staged.inspection.incompatible })
         error = { name: staged.inspection.manifest.name, reason: staged.inspection.incompatible }
         return
       }
+      discardCurrentSheetToken()
       setRowState(entry.id, { kind: 'confirming', token: staged.token })
       sheet = {
         catalogToken: staged.token,
@@ -118,6 +163,11 @@
         inspection: staged.inspection,
       }
     } catch (e) {
+      if (destroyed) return
+      if (seq !== stagingSeq) {
+        setRowState(entry.id, { kind: 'idle' })
+        return
+      }
       setRowState(entry.id, {
         kind: 'failed',
         reason: String((e as { message?: string }).message ?? e),
@@ -130,7 +180,7 @@
     sheet = null
     if (current?.catalogToken) {
       await invoke('extension_catalog_discard', { token: current.catalogToken })
-      if (current.catalogId) setRowState(current.catalogId, { kind: 'idle' })
+      if (!destroyed && current.catalogId) setRowState(current.catalogId, { kind: 'idle' })
     }
   }
 
@@ -139,15 +189,19 @@
     const path = testHooks?.pickExtensionFile
       ? await testHooks.pickExtensionFile()
       : await open({ filters: [{ name: t.extSettings.fileFilter, extensions: ['linenext'] }] })
-    if (typeof path !== 'string') return
+    if (typeof path !== 'string' || destroyed) return
     try {
       const inspection = await invoke<Inspection>('extension_inspect', { path })
+      if (destroyed) return
       if (inspection.incompatible) {
         error = { name: inspection.manifest.name, reason: inspection.incompatible }
         return
       }
+      stagingSeq++
+      discardCurrentSheetToken()
       sheet = { path, inspection }
     } catch (e) {
+      if (destroyed) return
       error = {
         name: path.split('/').pop() ?? path,
         reason: String((e as { message?: string }).message ?? e),
@@ -233,6 +287,12 @@
     void reload()
     void invoke<boolean>('app_safe_mode').then((v) => (safeMode = v))
     void ipc.settingGet('pinnedExtensions').then((v) => (pinned = JSON.parse(v ?? '[]')))
+    return () => {
+      destroyed = true
+      if (sheet?.catalogToken) {
+        void invoke('extension_catalog_discard', { token: sheet.catalogToken })
+      }
+    }
   })
 </script>
 
@@ -243,17 +303,27 @@
 <div class="subbar">
   <div class="segmented" role="tablist" aria-label={t.extSettings.catalog.tabsLabel}>
     <button
+      bind:this={installedTabEl}
+      id="ext-tab-installed"
       type="button"
       role="tab"
       class="seg"
       aria-selected={tab === 'installed'}
+      aria-controls="ext-panel-installed"
+      tabindex={tab === 'installed' ? 0 : -1}
+      onkeydown={onTabKeydown}
       onclick={() => selectTab('installed')}>{t.extSettings.catalog.tabInstalled}</button
     >
     <button
+      bind:this={browseTabEl}
+      id="ext-tab-browse"
       type="button"
       role="tab"
       class="seg"
       aria-selected={tab === 'browse'}
+      aria-controls="ext-panel-browse"
+      tabindex={tab === 'browse' ? 0 : -1}
+      onkeydown={onTabKeydown}
       onclick={() => selectTab('browse')}>{t.extSettings.catalog.tabBrowse}</button
     >
   </div>
@@ -261,293 +331,307 @@
 {#if safeMode}<p class="banner" role="status">{t.extSettings.safeMode}</p>{/if}
 {#if status}<p class="status" role="status">{status}</p>{/if}
 
-{#if tab === 'installed'}
-  <ul class="list">
-    {#each list as x (x.manifest.id)}
-      {@const m = x.manifest}
-      {@const themeOnly = m.contributes.themes.length > 0 && !m.main}
-      <li class="ext" data-extension={m.id}>
-        <span class="icon" aria-hidden="true">{m.name.slice(0, 1)}</span>
-        <div class="body">
-          <div class="title-row">
-            <span class="name" translate="no">{m.name}</span>
-            <span class="meta"
-              >{[kind(x), m.version, x.enabled ? null : t.extSettings.off]
-                .filter(Boolean)
-                .join(' · ')}</span
-            >
-            <span class="grow"></span>
-            <button
-              type="button"
-              role="switch"
-              class="switch"
-              aria-checked={x.enabled}
-              aria-label={t.extSettings.enabled(m.name)}
-              disabled={!!x.incompatible}
-              onclick={() => void setEnabled(x, !x.enabled)}><span class="thumb"></span></button
-            >
-          </div>
-          {#if m.description}<p class="description" translate="no">{m.description}</p>{/if}
-          {#if themeOnly}
-            <p class="chips">
-              <span class="label">{t.extSettings.adds}</span><span class="chip"
-                >{t.extSettings.themesAdded(1)}</span
-              >
-              <span class="label">{t.extSettings.can}</span><span class="plain"
-                >{t.extSettings.nothing}</span
-              >
-            </p>
-          {:else}
-            <p class="chips">
-              <span class="label">{t.extSettings.canAccess}</span>
-              {#each m.permissions as p (p)}
-                {@const l = permissionLabel(p)}
-                <span class="chip" class:warn={l.warn || l.network}
-                  >{#if l.network}<Icon name="globe" size={12} />{/if}{l.label}</span
-                >
-              {:else}
-                <span class="plain">{t.extSettings.noAccess}</span>
-              {/each}
-            </p>
-            {#if optional(x).length}
-              <!-- EP4, LK6 (Canvas 12): each host the reader allowed, with Remove. -->
-              <p class="chips" data-sends-to>
-                <span class="label">{t.extAccess.sendsTo}</span>
-                {#each optional(x) as p (p)}
-                  {@const host = p.slice('network:'.length)}
-                  <span class="chip warn"><Icon name="globe" size={12} />{host}</span>
-                  <span class="plain">{t.extAccess.sendsWhat} ·</span>
-                  <button
-                    type="button"
-                    class="link"
-                    aria-label={t.extAccess.removeHost(host)}
-                    onclick={() => void revoke(x, host)}>{t.extAccess.remove}</button
-                  >
-                {/each}
-              </p>
-            {/if}
-            {#if contributionLabels(m).length}
-              <p class="chips">
-                <span class="label">{t.extSettings.adds}</span>
-                {#each contributionLabels(m) as a (a)}<span class="chip">{a}</span>{/each}
-              </p>
-            {/if}
-          {/if}
-          {#if x.incompatible}
-            <p class="failure">
-              <Icon name="warning" size={14} />{t.extSettings.incompatible(x.incompatible)}
-            </p>
-          {:else if x.suspended || recentFailures(x)}
-            <div class="failure" role="status">
-              <Icon name="warning" size={14} />
-              <span class="grow"
-                >{x.suspended
-                  ? t.extSettings.suspended
-                  : t.extSettings.failures(recentFailures(x))}</span
-              >
-              <button type="button" class="btn small" onclick={() => void restart(x)}
-                >{t.extSettings.restart}</button
-              >
-              <button type="button" class="btn small" onclick={() => void setEnabled(x, false)}
-                >{t.extSettings.disable}</button
-              >
-            </div>
-          {/if}
-          {#if !x.builtin || m.contributes.commands.length || m.contributes.options}
-            <p class="actions">
-              {#if m.contributes.commands.length}
-                <label class="pin"
-                  ><input
-                    type="checkbox"
-                    checked={pinned.includes(m.id)}
-                    onchange={() => void togglePin(x)}
-                  />{t.extSettings.pin}</label
-                >
-              {/if}
-              {#if m.contributes.options && x.enabled && !x.incompatible}
-                <button
-                  type="button"
-                  class="link"
-                  data-options-button
-                  onclick={() => (optionsFor = x)}>{t.extAccess.options}</button
-                >
-              {/if}
-              {#if !x.builtin}
-                <button type="button" class="link" onclick={() => (removing = x)}
-                  >{t.extSettings.remove}</button
-                >
-              {/if}
-            </p>
-          {/if}
-        </div>
-      </li>
-    {/each}
-  </ul>
-
-  {#if optionsFor}
-    <OptionsDialog
-      extension={optionsFor}
-      {theme}
-      onclose={() => (optionsFor = null)}
-      onchanged={async () => {
-        await changed()
-        return list.find((e) => e.manifest.id === optionsFor?.manifest.id)
-      }}
-    />
-  {/if}
-
-  <div class="foot">
-    <button type="button" class="btn" onclick={() => void invoke('app_restart_safe')}
-      >{t.extSettings.restartWithout}</button
-    >
-    <span class="help">{t.extSettings.shiftHint}</span>
-  </div>
-{:else}
-  <div class="catalog-controls">
-    <input
-      type="search"
-      class="search"
-      bind:value={query}
-      aria-label={t.extSettings.catalog.searchLabel}
-      placeholder={t.extSettings.catalog.searchPlaceholder}
-    />
-    <button
-      type="button"
-      class="btn small"
-      disabled={catalogLoading}
-      onclick={() => void loadCatalog(true)}
-    >
-      {catalogLoading ? t.extSettings.catalog.refreshing : t.extSettings.catalog.refresh}
-    </button>
-  </div>
-  <div class="pills-row">
-    <div class="pills">
-      <button
-        type="button"
-        class="pill"
-        class:active={category === 'all'}
-        onclick={() => (category = 'all')}>{t.extSettings.catalog.categories.all}</button
-      >
-      {#each categoryOrder as cat (cat)}
-        <button
-          type="button"
-          class="pill"
-          class:active={category === cat}
-          onclick={() => (category = cat)}>{t.extSettings.catalog.categories[cat]}</button
-        >
-      {/each}
-    </div>
-    <label class="pin">
-      <input type="checkbox" bind:checked={showIncompatible} />{t.extSettings.catalog
-        .showIncompatible}
-    </label>
-  </div>
-
-  {#if catalog && (catalog.offline || catalog.stale)}
-    <p class="banner" role="status">{t.extSettings.catalog.offlineBanner}</p>
-  {/if}
-
-  {#if catalogLoading && !catalog}
-    <p class="plain" role="status">{t.extSettings.catalog.loading}</p>
-  {:else if catalogError && !catalog}
-    <div class="failure" role="status">
-      <Icon name="warning" size={14} />
-      <span class="grow">{t.extSettings.catalog.loadFailed} {catalogError}</span>
-      <button type="button" class="btn small" onclick={() => void loadCatalog(true)}
-        >{t.extSettings.catalog.retry}</button
-      >
-    </div>
-  {:else if filteredCatalog.length === 0}
-    <p class="plain">{t.extSettings.catalog.empty}</p>
-  {:else}
+<div
+  class="tabpanel"
+  role="tabpanel"
+  id={tab === 'installed' ? 'ext-panel-installed' : 'ext-panel-browse'}
+  aria-labelledby={tab === 'installed' ? 'ext-tab-installed' : 'ext-tab-browse'}
+>
+  {#if tab === 'installed'}
     <ul class="list">
-      {#each filteredCatalog as item (item.entry.id)}
-        {@const e = item.entry}
-        {@const rs = rowStateOf(e.id)}
-        <li class="ext" data-catalog-extension={e.id}>
-          <span class="icon" aria-hidden="true">{e.name.slice(0, 1)}</span>
+      {#each list as x (x.manifest.id)}
+        {@const m = x.manifest}
+        {@const themeOnly = m.contributes.themes.length > 0 && !m.main}
+        <li class="ext" data-extension={m.id}>
+          <span class="icon" aria-hidden="true">{m.name.slice(0, 1)}</span>
           <div class="body">
             <div class="title-row">
-              <span class="name" translate="no">{e.name}</span>
-              <span class="meta">
-                {[
-                  t.extSettings.catalog.categories[e.category],
-                  e.version,
-                  t.extSettings.catalog.byPublisher(e.publisher),
-                ].join(' · ')}
-              </span>
+              <span class="name" translate="no">{m.name}</span>
+              <span class="meta"
+                >{[kind(x), m.version, x.enabled ? null : t.extSettings.off]
+                  .filter(Boolean)
+                  .join(' · ')}</span
+              >
               <span class="grow"></span>
-              {#if item.state.kind === 'incompatible'}
-                <span class="plain">{t.extSettings.catalog.incompatibleBadge}</span>
-              {:else if item.state.kind === 'installedCurrent'}
-                <span class="plain">{t.extSettings.catalog.installedBadge}</span>
-              {:else if rs.kind === 'downloading'}
-                <button type="button" class="btn small" disabled
-                  >{t.extSettings.catalog.downloading}</button
-                >
-              {:else if rs.kind === 'installing'}
-                <button type="button" class="btn small" disabled
-                  >{t.extSettings.catalog.installing}</button
-                >
-              {:else if item.state.kind === 'updateAvailable'}
-                <button
-                  type="button"
-                  class="btn small primary"
-                  disabled={rs.kind === 'confirming'}
-                  onclick={() => void stageCatalogEntry(e)}>{t.extSettings.update}</button
-                >
-              {:else}
-                <button
-                  type="button"
-                  class="btn small primary"
-                  disabled={rs.kind === 'confirming'}
-                  onclick={() => void stageCatalogEntry(e)}>{t.extSettings.catalog.get}</button
-                >
-              {/if}
+              <button
+                type="button"
+                role="switch"
+                class="switch"
+                aria-checked={x.enabled}
+                aria-label={t.extSettings.enabled(m.name)}
+                disabled={!!x.incompatible}
+                onclick={() => void setEnabled(x, !x.enabled)}><span class="thumb"></span></button
+              >
             </div>
-            <p class="description" translate="no">{e.summary}</p>
-            {#if item.state.kind === 'updateAvailable'}
-              <p class="plain">{t.extSettings.catalog.updateFrom(item.state.installedVersion)}</p>
-            {/if}
-            {#if e.permissions.length}
+            {#if m.description}<p class="description" translate="no">{m.description}</p>{/if}
+            {#if themeOnly}
+              <p class="chips">
+                <span class="label">{t.extSettings.adds}</span><span class="chip"
+                  >{t.extSettings.themesAdded(1)}</span
+                >
+                <span class="label">{t.extSettings.can}</span><span class="plain"
+                  >{t.extSettings.nothing}</span
+                >
+              </p>
+            {:else}
               <p class="chips">
                 <span class="label">{t.extSettings.canAccess}</span>
-                {#each e.permissions as p (p)}
+                {#each m.permissions as p (p)}
                   {@const l = permissionLabel(p)}
                   <span class="chip" class:warn={l.warn || l.network}
                     >{#if l.network}<Icon name="globe" size={12} />{/if}{l.label}</span
                   >
+                {:else}
+                  <span class="plain">{t.extSettings.noAccess}</span>
                 {/each}
               </p>
+              {#if optional(x).length}
+                <!-- EP4, LK6 (Canvas 12): each host the reader allowed, with Remove. -->
+                <p class="chips" data-sends-to>
+                  <span class="label">{t.extAccess.sendsTo}</span>
+                  {#each optional(x) as p (p)}
+                    {@const host = p.slice('network:'.length)}
+                    <span class="chip warn"><Icon name="globe" size={12} />{host}</span>
+                    <span class="plain">{t.extAccess.sendsWhat} ·</span>
+                    <button
+                      type="button"
+                      class="link"
+                      aria-label={t.extAccess.removeHost(host)}
+                      onclick={() => void revoke(x, host)}>{t.extAccess.remove}</button
+                    >
+                  {/each}
+                </p>
+              {/if}
+              {#if contributionLabels(m).length}
+                <p class="chips">
+                  <span class="label">{t.extSettings.adds}</span>
+                  {#each contributionLabels(m) as a (a)}<span class="chip">{a}</span>{/each}
+                </p>
+              {/if}
             {/if}
-            {#if e.contributesSummary.length}
-              <p class="chips">
-                <span class="label">{t.extSettings.adds}</span>
-                {#each e.contributesSummary as c (c)}<span class="chip">{c}</span>{/each}
-              </p>
-            {/if}
-            {#if item.state.kind === 'incompatible'}
+            {#if x.incompatible}
               <p class="failure">
-                <Icon name="warning" size={14} />{item.state.reason}
+                <Icon name="warning" size={14} />{t.extSettings.incompatible(x.incompatible)}
               </p>
-            {:else if rs.kind === 'failed'}
-              <p class="failure" role="status">
-                <Icon name="warning" size={14} />{rs.reason}
+            {:else if x.suspended || recentFailures(x)}
+              <div class="failure" role="status">
+                <Icon name="warning" size={14} />
+                <span class="grow"
+                  >{x.suspended
+                    ? t.extSettings.suspended
+                    : t.extSettings.failures(recentFailures(x))}</span
+                >
+                <button type="button" class="btn small" onclick={() => void restart(x)}
+                  >{t.extSettings.restart}</button
+                >
+                <button type="button" class="btn small" onclick={() => void setEnabled(x, false)}
+                  >{t.extSettings.disable}</button
+                >
+              </div>
+            {/if}
+            {#if !x.builtin || m.contributes.commands.length || m.contributes.options}
+              <p class="actions">
+                {#if m.contributes.commands.length}
+                  <label class="pin"
+                    ><input
+                      type="checkbox"
+                      checked={pinned.includes(m.id)}
+                      onchange={() => void togglePin(x)}
+                    />{t.extSettings.pin}</label
+                  >
+                {/if}
+                {#if m.contributes.options && x.enabled && !x.incompatible}
+                  <button
+                    type="button"
+                    class="link"
+                    data-options-button
+                    onclick={() => (optionsFor = x)}>{t.extAccess.options}</button
+                  >
+                {/if}
+                {#if !x.builtin}
+                  <button type="button" class="link" onclick={() => (removing = x)}
+                    >{t.extSettings.remove}</button
+                  >
+                {/if}
               </p>
             {/if}
-            <p class="actions">
-              <button
-                type="button"
-                class="link"
-                onclick={() => void invoke('open_external', { url: e.homepage })}
-                >{t.extSettings.catalog.website}</button
-              >
-            </p>
           </div>
         </li>
       {/each}
     </ul>
+
+    <div class="foot">
+      <button type="button" class="btn" onclick={() => void invoke('app_restart_safe')}
+        >{t.extSettings.restartWithout}</button
+      >
+      <span class="help">{t.extSettings.shiftHint}</span>
+    </div>
+  {:else}
+    <div class="catalog-controls">
+      <input
+        type="search"
+        class="search"
+        bind:value={query}
+        aria-label={t.extSettings.catalog.searchLabel}
+        placeholder={t.extSettings.catalog.searchPlaceholder}
+      />
+      <button
+        type="button"
+        class="btn small"
+        disabled={catalogLoading}
+        onclick={() => void loadCatalog(true)}
+      >
+        {catalogLoading ? t.extSettings.catalog.refreshing : t.extSettings.catalog.refresh}
+      </button>
+    </div>
+    <div class="pills-row">
+      <div class="pills">
+        <button
+          type="button"
+          class="pill"
+          class:active={category === 'all'}
+          aria-pressed={category === 'all'}
+          onclick={() => (category = 'all')}>{t.extSettings.catalog.categories.all}</button
+        >
+        {#each categoryOrder as cat (cat)}
+          <button
+            type="button"
+            class="pill"
+            class:active={category === cat}
+            aria-pressed={category === cat}
+            onclick={() => (category = cat)}>{t.extSettings.catalog.categories[cat]}</button
+          >
+        {/each}
+      </div>
+      <label class="pin">
+        <input type="checkbox" bind:checked={showIncompatible} />{t.extSettings.catalog
+          .showIncompatible}
+      </label>
+    </div>
+
+    {#if catalog && (catalog.offline || catalog.stale)}
+      <p class="banner" role="status">{t.extSettings.catalog.offlineBanner}</p>
+    {/if}
+
+    {#if catalogError}
+      <div class="failure" role="status">
+        <Icon name="warning" size={14} />
+        <span class="grow">{t.extSettings.catalog.loadFailed} {catalogError}</span>
+        <button type="button" class="btn small" onclick={() => void loadCatalog(true)}
+          >{t.extSettings.catalog.retry}</button
+        >
+      </div>
+    {/if}
+
+    {#if catalogLoading && !catalog}
+      <p class="plain" role="status">{t.extSettings.catalog.loading}</p>
+    {:else if !catalog && catalogError}
+      <!-- Error banner rendered above. -->
+    {:else if filteredCatalog.length === 0}
+      <p class="plain">{t.extSettings.catalog.empty}</p>
+    {:else}
+      <ul class="list">
+        {#each filteredCatalog as item (item.entry.id)}
+          {@const e = item.entry}
+          {@const rs = rowStateOf(e.id)}
+          <li class="ext" data-catalog-extension={e.id}>
+            <span class="icon" aria-hidden="true">{e.name.slice(0, 1)}</span>
+            <div class="body">
+              <div class="title-row">
+                <span class="name" translate="no">{e.name}</span>
+                <span class="meta">
+                  {[
+                    t.extSettings.catalog.categories[e.category],
+                    e.version,
+                    t.extSettings.catalog.byPublisher(e.publisher),
+                  ].join(' · ')}
+                </span>
+                <span class="grow"></span>
+                {#if item.state.kind === 'incompatible'}
+                  <span class="plain">{t.extSettings.catalog.incompatibleBadge}</span>
+                {:else if item.state.kind === 'installedCurrent'}
+                  <span class="plain">{t.extSettings.catalog.installedBadge}</span>
+                {:else if rs.kind === 'downloading'}
+                  <button type="button" class="btn small" disabled
+                    >{t.extSettings.catalog.downloading}</button
+                  >
+                {:else if rs.kind === 'installing'}
+                  <button type="button" class="btn small" disabled
+                    >{t.extSettings.catalog.installing}</button
+                  >
+                {:else if item.state.kind === 'updateAvailable'}
+                  <button
+                    type="button"
+                    class="btn small primary"
+                    disabled={rs.kind === 'confirming'}
+                    onclick={() => void stageCatalogEntry(e)}>{t.extSettings.update}</button
+                  >
+                {:else}
+                  <button
+                    type="button"
+                    class="btn small primary"
+                    disabled={rs.kind === 'confirming'}
+                    onclick={() => void stageCatalogEntry(e)}>{t.extSettings.catalog.get}</button
+                  >
+                {/if}
+              </div>
+              <p class="description" translate="no">{e.summary}</p>
+              {#if item.state.kind === 'updateAvailable'}
+                <p class="plain">{t.extSettings.catalog.updateFrom(item.state.installedVersion)}</p>
+              {/if}
+              {#if e.permissions.length}
+                <p class="chips">
+                  <span class="label">{t.extSettings.canAccess}</span>
+                  {#each e.permissions as p (p)}
+                    {@const l = permissionLabel(p)}
+                    <span class="chip" class:warn={l.warn || l.network}
+                      >{#if l.network}<Icon name="globe" size={12} />{/if}{l.label}</span
+                    >
+                  {/each}
+                </p>
+              {/if}
+              {#if e.contributesSummary.length}
+                <p class="chips">
+                  <span class="label">{t.extSettings.adds}</span>
+                  {#each e.contributesSummary as c (c)}<span class="chip" translate="no">{c}</span
+                    >{/each}
+                </p>
+              {/if}
+              {#if item.state.kind === 'incompatible'}
+                <p class="failure">
+                  <Icon name="warning" size={14} />{item.state.reason}
+                </p>
+              {:else if rs.kind === 'failed'}
+                <p class="failure" role="status">
+                  <Icon name="warning" size={14} />{rs.reason}
+                </p>
+              {/if}
+              <p class="actions">
+                <button
+                  type="button"
+                  class="link"
+                  onclick={() => void invoke('open_external', { url: e.homepage })}
+                  >{t.extSettings.catalog.website}</button
+                >
+              </p>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {/if}
   {/if}
+</div>
+
+{#if optionsFor}
+  <OptionsDialog
+    extension={optionsFor}
+    {theme}
+    onclose={() => (optionsFor = null)}
+    onchanged={async () => {
+      await changed()
+      return list.find((e) => e.manifest.id === optionsFor?.manifest.id)
+    }}
+  />
 {/if}
 
 <!-- G1: the install sheet (provisional). -->
@@ -663,13 +747,16 @@
     background: var(--control-track);
     box-shadow: inset 0 0 0 1px var(--segment-ring);
   }
+  .tabpanel {
+    display: contents;
+  }
   .seg {
     height: 28px;
     padding: 0 14px;
     border: 0;
     border-radius: 6px;
     background: transparent;
-    color: var(--ink-secondary);
+    color: var(--track-ink);
     font: 500 13px var(--font-ui);
   }
   .seg[aria-selected='true'] {

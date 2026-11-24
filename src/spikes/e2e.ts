@@ -7948,6 +7948,10 @@ export async function spikeE2E(): Promise<SpikeResult> {
     optIn: true,
     run: async () => {
       await invoke('spike_catalog_server')
+      const existing = await invoke<{ manifest: { id: string } }[]>('extensions_list')
+      if (existing.some((x) => x.manifest.id === 'org.example.dictionary')) {
+        await invoke('extension_remove', { id: 'org.example.dictionary', deleteData: true })
+      }
       const { default: Preferences } = await import('../prefs/Preferences.svelte')
       const host = document.createElement('div')
       host.style.cssText = 'position:fixed;inset:0;z-index:100;background:var(--ground)'
@@ -7988,7 +7992,7 @@ export async function spikeE2E(): Promise<SpikeResult> {
         const dictRow = host.querySelector<HTMLElement>(
           '[data-catalog-extension="org.example.dictionary"]',
         )
-        const getBtn = dictRow?.querySelector<HTMLButtonElement>('button')
+        const getBtn = dictRow?.querySelector<HTMLButtonElement>('button.primary')
         if (!getBtn) return 'Get button for Dictionary not found'
         getBtn.click()
 
