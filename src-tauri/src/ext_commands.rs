@@ -453,9 +453,9 @@ pub async fn extension_catalog_list(
     state: State<'_, AppState>,
     force: bool,
 ) -> CmdResult<CatalogResponse> {
-    let cache = catalog::read_cache(&state.store.lock().unwrap())?;
     let url = catalog::catalog_url();
     let pubkey = catalog::catalog_pubkey();
+    let cache = catalog::read_cache(&state.store.lock().unwrap(), &url, &pubkey)?;
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         catalog::fetch_catalog_network(cache, force, &url, &pubkey)
     })
@@ -476,7 +476,9 @@ pub async fn extension_catalog_stage(
     staging: State<'_, CatalogStaging>,
     id: String,
 ) -> CmdResult<StagedInspection> {
-    let entry = catalog::find_cached_entry(&state.store.lock().unwrap(), &id)?;
+    let url = catalog::catalog_url();
+    let pubkey = catalog::catalog_pubkey();
+    let entry = catalog::find_cached_entry(&state.store.lock().unwrap(), &url, &pubkey, &id)?;
     let ext_dir = state.library.extensions_dir.clone();
     let entry_dl = entry.clone();
     let staged_path = tauri::async_runtime::spawn_blocking(move || {

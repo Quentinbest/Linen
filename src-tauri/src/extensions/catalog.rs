@@ -30,6 +30,8 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const KEY_CACHE: &str = "extCatalogCache";
 const KEY_ETAG: &str = "extCatalogEtag";
 const KEY_FETCHED_AT: &str = "extCatalogFetchedAt";
+const KEY_URL: &str = "extCatalogUrl";
+const KEY_PUBKEY: &str = "extCatalogPubkey";
 const STAGING_DIR: &str = ".staging";
 
 #[derive(Debug, thiserror::Error)]
@@ -304,15 +306,15 @@ pub fn parse_and_verify(
                 entry.id, entry.engines_linen
             ))
         })?;
-        if !allowed_url(&entry.homepage) {
+        if !allowed_url(&entry.homepage) || url_host(&entry.homepage).is_none() {
             return Err(CatalogError::Invalid(format!(
-                "entry “{}” homepage must use https://",
+                "entry “{}” homepage must be a valid https:// URL",
                 entry.id
             )));
         }
-        if !allowed_url(&entry.download_url) {
+        if !allowed_url(&entry.download_url) || url_host(&entry.download_url).is_none() {
             return Err(CatalogError::Invalid(format!(
-                "entry “{}” downloadUrl must use https://",
+                "entry “{}” downloadUrl must be a valid https:// URL",
                 entry.id
             )));
         }
@@ -368,9 +370,18 @@ pub struct CachedCatalog {
     pub fetched_at: Option<i64>,
 }
 
-pub fn read_cache(store: &Store) -> Result<CachedCatalog, CatalogError> {
+pub fn read_cache(store: &Store, url: &str, pubkey: &str) -> Result<CachedCatalog, CatalogError> {
+    let stored_url = store.setting(KEY_URL)?;
+    let stored_pubkey = store.setting(KEY_PUBKEY)?;
+    if stored_url.as_deref() != Some(url) || stored_pubkey.as_deref() != Some(pubkey) {
+        return Ok(CachedCatalog {
+            doc: None,
+            etag: None,
+            fetched_at: None,
+        });
+    }
     let json = store.setting(KEY_CACHE)?;
-    let etag = store.setting(KEY_ETAG)?;
+    let etag = store.setting(KEY_ETAG)?.filter(|s| !s.is_empty());
     let fetched_at = store
         .setting(KEY_FETCHED_AT)?
         .and_then(|s| s.parse::<i64>().ok());
@@ -382,8 +393,13 @@ pub fn read_cache(store: &Store) -> Result<CachedCatalog, CatalogError> {
     })
 }
 
-pub fn find_cached_entry(store: &Store, id: &str) -> Result<CatalogEntry, CatalogError> {
-    let cache = read_cache(store)?;
+pub fn find_cached_entry(
+    store: &Store,
+    url: &str,
+    pubkey: &str,
+    id: &str,
+) -> Result<CatalogEntry, CatalogError> {
+    let cache = read_cache(store, url, pubkey)?;
     let doc = cache
         .doc
         .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
@@ -403,11 +419,44 @@ fn make_agent(timeout: Duration) -> ureq::Agent {
         .into()
 }
 
+fn resolve_redirect(current: &str, origin_host: &str, loc: &str) -> Result<String, CatalogError> {
+    let (scheme, _) = current
+        .split_once("://")
+        .ok_or_else(|| CatalogError::Network("invalid current URL".into()))?;
+    let next_url = if loc.starts_with("//") {
+        format!("{scheme}:{loc}")
+    } else if loc.starts_with('/') {
+        format!("{scheme}://{origin_host}{loc}")
+    } else if loc.contains("://") {
+        loc.to_string()
+    } else {
+        let base = current.split(['?', '#']).next().unwrap_or(current);
+        let scheme_end = base.find("://").map(|i| i + 3).unwrap_or(0);
+        match base[scheme_end..].rfind('/') {
+            Some(rel_idx) => format!("{}{loc}", &base[..scheme_end + rel_idx + 1]),
+            None => format!("{base}/{loc}"),
+        }
+    };
+    if !allowed_url(&next_url) {
+        return Err(CatalogError::Network(
+            "redirected to a disallowed URL scheme".into(),
+        ));
+    }
+    let next_host = url_host(&next_url)
+        .ok_or_else(|| CatalogError::Network("redirect target has no host".into()))?;
+    if next_host != origin_host {
+        return Err(CatalogError::Network(format!(
+            "refused cross-host redirect from {origin_host} to {next_host}"
+        )));
+    }
+    Ok(next_url)
+}
+
 fn get_same_host(
     agent: &ureq::Agent,
     initial_url: &str,
     etag: Option<&str>,
-) -> Result<ureq::http::Response<ureq::Body>, CatalogError> {
+) -> Result<(ureq::http::Response<ureq::Body>, String), CatalogError> {
     if !allowed_url(initial_url) {
         return Err(CatalogError::Invalid(format!(
             "disallowed URL: {initial_url}"
@@ -437,28 +486,10 @@ fn get_same_host(
                 .get("location")
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| CatalogError::Network("redirect missing Location header".into()))?;
-            let next_url = if loc.starts_with('/') {
-                let (scheme, _) = current.split_once("://").unwrap();
-                format!("{scheme}://{origin_host}{loc}")
-            } else {
-                loc.to_string()
-            };
-            if !allowed_url(&next_url) {
-                return Err(CatalogError::Network(
-                    "redirected to a disallowed URL scheme".into(),
-                ));
-            }
-            let next_host = url_host(&next_url)
-                .ok_or_else(|| CatalogError::Network("redirect target has no host".into()))?;
-            if next_host != origin_host {
-                return Err(CatalogError::Network(format!(
-                    "refused cross-host redirect from {origin_host} to {next_host}"
-                )));
-            }
-            current = next_url;
+            current = resolve_redirect(&current, &origin_host, loc)?;
             continue;
         }
-        return Ok(resp);
+        return Ok((resp, current));
     }
     Err(CatalogError::Network("too many redirects".into()))
 }
@@ -490,6 +521,8 @@ pub enum FetchOutcome {
         raw_json: String,
         etag: Option<String>,
         fetched_at: i64,
+        url: String,
+        pubkey: String,
     },
     OfflineFallback {
         doc: CatalogDocument,
@@ -507,7 +540,7 @@ pub fn fetch_catalog_network(
     let now = now_ms();
     if !force {
         if let (Some(doc), Some(fetched_at)) = (&cache.doc, cache.fetched_at) {
-            if now - fetched_at < CACHE_TTL_MS {
+            if now >= fetched_at && now - fetched_at < CACHE_TTL_MS {
                 return Ok(FetchOutcome::FreshCache {
                     doc: doc.clone(),
                     fetched_at,
@@ -518,7 +551,7 @@ pub fn fetch_catalog_network(
 
     let agent = make_agent(CATALOG_TIMEOUT);
     let etag_ref = cache.doc.as_ref().and(cache.etag.as_deref());
-    let resp = match get_same_host(&agent, url, etag_ref) {
+    let (resp, final_url) = match get_same_host(&agent, url, etag_ref) {
         Ok(r) => r,
         Err(e) => {
             if let (Some(doc), Some(fetched_at)) = (cache.doc, cache.fetched_at) {
@@ -548,13 +581,14 @@ pub fn fetch_catalog_network(
         .headers()
         .get("etag")
         .and_then(|v| v.to_str().ok())
-        .map(String::from);
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let json_bytes = read_bounded(resp.into_body().into_reader(), MAX_CATALOG_BYTES)?;
 
-    let sig_url = format!("{url}.minisig");
-    let sig_resp = match get_same_host(&agent, &sig_url, None) {
-        Ok(r) if r.status().as_u16() == 200 => r,
-        Ok(r) => {
+    let sig_url = format!("{final_url}.minisig");
+    let (sig_resp, _) = match get_same_host(&agent, &sig_url, None) {
+        Ok((r, u)) if r.status().as_u16() == 200 => (r, u),
+        Ok((r, _)) => {
             return Err(CatalogError::Verification(format!(
                 "signature fetch returned HTTP {}",
                 r.status().as_u16()
@@ -577,6 +611,8 @@ pub fn fetch_catalog_network(
         raw_json,
         etag: new_etag,
         fetched_at: now,
+        url: url.to_string(),
+        pubkey: pubkey.to_string(),
     })
 }
 
@@ -606,11 +642,13 @@ pub fn apply_fetch_outcome(
             raw_json,
             etag,
             fetched_at,
+            url,
+            pubkey,
         } => {
             store.set_setting(KEY_CACHE, &raw_json)?;
-            if let Some(tag) = etag {
-                store.set_setting(KEY_ETAG, &tag)?;
-            }
+            store.set_setting(KEY_URL, &url)?;
+            store.set_setting(KEY_PUBKEY, &pubkey)?;
+            store.set_setting(KEY_ETAG, etag.as_deref().unwrap_or(""))?;
             store.set_setting(KEY_FETCHED_AT, &fetched_at.to_string())?;
             Ok(CatalogResponse {
                 entries: build_views(doc, installed),
@@ -634,9 +672,9 @@ pub fn download_package(
     extensions_dir: &Path,
     entry: &CatalogEntry,
 ) -> Result<PathBuf, CatalogError> {
-    if !allowed_url(&entry.download_url) {
+    if !allowed_url(&entry.download_url) || url_host(&entry.download_url).is_none() {
         return Err(CatalogError::Invalid(format!(
-            "downloadUrl for “{}” must use https://",
+            "downloadUrl for “{}” must be a valid https:// URL",
             entry.id
         )));
     }
@@ -646,7 +684,7 @@ pub fn download_package(
 
     let res = (|| -> Result<(), CatalogError> {
         let agent = make_agent(DOWNLOAD_TIMEOUT);
-        let resp = get_same_host(&agent, &entry.download_url, None)?;
+        let (resp, _) = get_same_host(&agent, &entry.download_url, None)?;
         let status = resp.status().as_u16();
         if status != 200 {
             return Err(CatalogError::Network(format!("HTTP {status}")));
@@ -920,6 +958,22 @@ mod tests {
         let mut zero_size = base.clone();
         zero_size.size_bytes = 0;
         check_invalid(zero_size);
+
+        let mut userinfo_homepage = base.clone();
+        userinfo_homepage.homepage = "https://user:pass@evil.example/dict".into();
+        check_invalid(userinfo_homepage);
+
+        let mut query_only_homepage = base.clone();
+        query_only_homepage.homepage = "https://?queryonly".into();
+        check_invalid(query_only_homepage);
+
+        let mut userinfo_download = base.clone();
+        userinfo_download.download_url = "https://user:pass@evil.example/dict.linenext".into();
+        check_invalid(userinfo_download);
+
+        let mut query_only_download = base.clone();
+        query_only_download.download_url = "https://?queryonly".into();
+        check_invalid(query_only_download);
     }
 
     #[test]
@@ -1095,7 +1149,7 @@ mod tests {
         let catalog_url = format!("{base_url}/catalog.json");
 
         // 1. Initial fetch (200 OK + signature verified + cached).
-        let cache = read_cache(&store).unwrap();
+        let cache = read_cache(&store, &catalog_url, &pubkey).unwrap();
         let outcome = fetch_catalog_network(cache, false, &catalog_url, &pubkey).unwrap();
         assert!(matches!(outcome, FetchOutcome::Updated { .. }));
         let resp = apply_fetch_outcome(&mut store, &[], outcome).unwrap();
@@ -1103,12 +1157,12 @@ mod tests {
         assert_eq!(resp.entries.len(), 3);
 
         // 2. Fresh cache hit (no network request).
-        let cache = read_cache(&store).unwrap();
+        let cache = read_cache(&store, &catalog_url, &pubkey).unwrap();
         let outcome = fetch_catalog_network(cache, false, &catalog_url, &pubkey).unwrap();
         assert!(matches!(outcome, FetchOutcome::FreshCache { .. }));
 
         // 3. Force refresh hits ETag 304 Not Modified.
-        let cache = read_cache(&store).unwrap();
+        let cache = read_cache(&store, &catalog_url, &pubkey).unwrap();
         let outcome = fetch_catalog_network(cache, true, &catalog_url, &pubkey).unwrap();
         assert!(matches!(outcome, FetchOutcome::NotModified { .. }));
         let resp = apply_fetch_outcome(&mut store, &[], outcome).unwrap();
@@ -1166,12 +1220,306 @@ mod tests {
         server.join().unwrap();
 
         // 8. Offline fallback after server closes: returns cached catalog with offline=true, stale=true.
-        let cache = read_cache(&store).unwrap();
+        let cache = read_cache(&store, &catalog_url, &pubkey).unwrap();
         let outcome = fetch_catalog_network(cache, true, &catalog_url, &pubkey).unwrap();
         assert!(matches!(outcome, FetchOutcome::OfflineFallback { .. }));
         let installed = registry::list(&store, &ext_dir).unwrap();
         let resp = apply_fetch_outcome(&mut store, &installed, outcome).unwrap();
         assert!(resp.offline && resp.stale);
         assert_eq!(resp.entries[0].state, EntryInstallState::InstalledCurrent);
+    }
+
+    #[test]
+    fn cache_is_bound_to_active_url_and_pubkey() {
+        let (_sk, _key_id, pubkey) = test_keypair();
+        let doc = CatalogDocument {
+            schema_version: 1,
+            generated_at: 1_700_000_000_000,
+            entries: vec![sample_entry(
+                "https://example.org/dict.linenext",
+                &"a".repeat(64),
+                1024,
+            )],
+        };
+        let raw_json = serde_json::to_string(&doc).unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let url_a = "https://extensions.linen.app/catalog/v1/catalog.json";
+        let url_b = "https://extensions.linen.app/catalog/v2/catalog.json";
+        let other_key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+
+        apply_fetch_outcome(
+            &mut store,
+            &[],
+            FetchOutcome::Updated {
+                doc: doc.clone(),
+                raw_json,
+                etag: Some("\"v1\"".into()),
+                fetched_at: now_ms(),
+                url: url_a.into(),
+                pubkey: pubkey.clone(),
+            },
+        )
+        .unwrap();
+
+        // Matching (url, pubkey) hits cache and finds entry.
+        let hit = read_cache(&store, url_a, &pubkey).unwrap();
+        assert!(hit.doc.is_some());
+        assert_eq!(hit.etag.as_deref(), Some("\"v1\""));
+        assert!(find_cached_entry(&store, url_a, &pubkey, "org.example.dictionary").is_ok());
+
+        // Different pubkey misses cache and find_cached_entry.
+        let wrong_key = read_cache(&store, url_a, other_key).unwrap();
+        assert!(wrong_key.doc.is_none());
+        assert!(wrong_key.etag.is_none());
+        assert!(wrong_key.fetched_at.is_none());
+        assert!(matches!(
+            find_cached_entry(&store, url_a, other_key, "org.example.dictionary"),
+            Err(CatalogError::NotFound(_))
+        ));
+
+        // Different URL misses cache and find_cached_entry.
+        let wrong_url = read_cache(&store, url_b, &pubkey).unwrap();
+        assert!(wrong_url.doc.is_none());
+        assert!(wrong_url.etag.is_none());
+        assert!(wrong_url.fetched_at.is_none());
+        assert!(matches!(
+            find_cached_entry(&store, url_b, &pubkey, "org.example.dictionary"),
+            Err(CatalogError::NotFound(_))
+        ));
+
+        // Force=true with wrong key does not send stale If-None-Match or accept 304 from old cache.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let local_url = format!("http://127.0.0.1:{port}/catalog.json");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut saw_if_none_match = false;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                if line.to_ascii_lowercase().starts_with("if-none-match:") {
+                    saw_if_none_match = true;
+                }
+            }
+            assert!(
+                !saw_if_none_match,
+                "wrong-key cache miss must not send stale If-None-Match"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let miss = read_cache(&store, &local_url, other_key).unwrap();
+        let err = fetch_catalog_network(miss, true, &local_url, other_key);
+        assert!(matches!(err, Err(CatalogError::Network(_))));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn updating_without_etag_clears_stale_etag() {
+        let (_sk, _key_id, pubkey) = test_keypair();
+        let doc = CatalogDocument {
+            schema_version: 1,
+            generated_at: 1_700_000_000_000,
+            entries: vec![],
+        };
+        let raw_json = serde_json::to_string(&doc).unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let url = "https://extensions.linen.app/catalog/v1/catalog.json";
+
+        apply_fetch_outcome(
+            &mut store,
+            &[],
+            FetchOutcome::Updated {
+                doc: doc.clone(),
+                raw_json: raw_json.clone(),
+                etag: Some("\"old-etag\"".into()),
+                fetched_at: now_ms(),
+                url: url.into(),
+                pubkey: pubkey.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_cache(&store, url, &pubkey).unwrap().etag.as_deref(),
+            Some("\"old-etag\"")
+        );
+
+        apply_fetch_outcome(
+            &mut store,
+            &[],
+            FetchOutcome::Updated {
+                doc,
+                raw_json,
+                etag: None,
+                fetched_at: now_ms(),
+                url: url.into(),
+                pubkey: pubkey.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(read_cache(&store, url, &pubkey).unwrap().etag, None);
+    }
+
+    #[test]
+    fn clock_rollback_does_not_treat_future_cache_as_fresh() {
+        let (sk, key_id, pubkey) = test_keypair();
+        let doc = CatalogDocument {
+            schema_version: 1,
+            generated_at: 1_700_000_000_000,
+            entries: vec![sample_entry(
+                "https://example.org/dict.linenext",
+                &"a".repeat(64),
+                1024,
+            )],
+        };
+        let catalog_json = Arc::new(serde_json::to_vec(&doc).unwrap());
+        let catalog_sig = Arc::new(sign_minisign(&sk, &key_id, &catalog_json));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/catalog.json");
+        let cj = catalog_json.clone();
+        let cs = catalog_sig.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let body = if path == "/catalog.json.minisig" {
+                    &cs
+                } else {
+                    &cj
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let cache = CachedCatalog {
+            doc: Some(doc),
+            etag: None,
+            fetched_at: Some(now_ms() + 60_000),
+        };
+        let outcome = fetch_catalog_network(cache, false, &url, &pubkey).unwrap();
+        assert!(matches!(outcome, FetchOutcome::Updated { .. }));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn redirects_resolve_relative_protocol_relative_and_minisig_follows_final_url() {
+        let (sk, key_id, pubkey) = test_keypair();
+        let doc = CatalogDocument {
+            schema_version: 1,
+            generated_at: 1_700_000_000_000,
+            entries: vec![sample_entry(
+                "https://example.org/dict.linenext",
+                &"a".repeat(64),
+                1024,
+            )],
+        };
+        let catalog_json = Arc::new(serde_json::to_vec(&doc).unwrap());
+        let catalog_sig = Arc::new(sign_minisign(&sk, &key_id, &catalog_json));
+
+        // Unit check on cross-host protocol-relative rejection.
+        assert!(resolve_redirect(
+            "https://extensions.linen.app/v1/catalog.json",
+            "extensions.linen.app",
+            "//evil.example/catalog.json",
+        )
+        .is_err());
+
+        // Integration check:
+        // /v1/catalog.json -> 302 Location: //127.0.0.1:<port>/v2/catalog.json
+        // /v2/catalog.json -> 302 Location: sub/final.json (relative without leading '/')
+        // /v2/sub/final.json -> 200 OK
+        // /v2/sub/final.json.minisig -> 200 OK (must be requested at final redirected URL)
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/v1/catalog.json");
+        let cj = catalog_json.clone();
+        let cs = catalog_sig.clone();
+
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                match path {
+                    "/v1/catalog.json" => {
+                        write!(
+                            stream,
+                            "HTTP/1.1 302 Found\r\nLocation: //127.0.0.1:{port}/v2/catalog.json\r\nContent-Length: 0\r\n\r\n"
+                        )
+                        .unwrap();
+                    }
+                    "/v2/catalog.json" => {
+                        write!(
+                            stream,
+                            "HTTP/1.1 302 Found\r\nLocation: sub/final.json\r\nContent-Length: 0\r\n\r\n"
+                        )
+                        .unwrap();
+                    }
+                    "/v2/sub/final.json" => {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                            cj.len()
+                        )
+                        .unwrap();
+                        stream.write_all(&cj).unwrap();
+                    }
+                    "/v2/sub/final.json.minisig" => {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                            cs.len()
+                        )
+                        .unwrap();
+                        stream.write_all(&cs).unwrap();
+                    }
+                    other => panic!("unexpected request path: {other}"),
+                }
+            }
+        });
+
+        let empty_cache = CachedCatalog {
+            doc: None,
+            etag: None,
+            fetched_at: None,
+        };
+        let outcome = fetch_catalog_network(empty_cache, false, &url, &pubkey).unwrap();
+        assert!(matches!(outcome, FetchOutcome::Updated { .. }));
+        server.join().unwrap();
     }
 }
