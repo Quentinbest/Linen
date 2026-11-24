@@ -1,6 +1,6 @@
 [package]
 name = "linen"
-version = "0.5.3"
+version = "0.6.0"
 description = "Linen, a quiet EPUB reader"
 license = "MIT"
 edition = "2021"
