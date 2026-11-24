@@ -168,7 +168,23 @@ pub fn cleanup_staging(extensions_dir: &Path) {
     }
 }
 
+#[cfg(feature = "spikes")]
+static SPIKE_OVERRIDE: std::sync::OnceLock<Mutex<Option<(String, String)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "spikes")]
+pub fn set_spike_override(url: String, pubkey: String) {
+    let lock = SPIKE_OVERRIDE.get_or_init(|| Mutex::new(None));
+    *lock.lock().unwrap() = Some((url, pubkey));
+}
+
 pub fn catalog_url() -> String {
+    #[cfg(feature = "spikes")]
+    if let Some(lock) = SPIKE_OVERRIDE.get() {
+        if let Some((url, _)) = lock.lock().unwrap().as_ref() {
+            return url.clone();
+        }
+    }
     #[cfg(any(test, feature = "spikes"))]
     if let Ok(url) = std::env::var("LINEN_CATALOG_URL") {
         if !url.is_empty() {
@@ -179,6 +195,12 @@ pub fn catalog_url() -> String {
 }
 
 pub fn catalog_pubkey() -> String {
+    #[cfg(feature = "spikes")]
+    if let Some(lock) = SPIKE_OVERRIDE.get() {
+        if let Some((_, key)) = lock.lock().unwrap().as_ref() {
+            return key.clone();
+        }
+    }
     #[cfg(any(test, feature = "spikes"))]
     if let Ok(key) = std::env::var("LINEN_CATALOG_PUBKEY") {
         if !key.is_empty() {

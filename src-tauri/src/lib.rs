@@ -198,6 +198,7 @@ pub fn run() {
         spikes::spike_vault_has,
         spikes::spike_bundle_languages,
         spikes::sync_slice::spike_sync_slice,
+        spikes::spike_catalog_server,
         spikes::spike_exit
     ));
     builder
