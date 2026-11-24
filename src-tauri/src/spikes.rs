@@ -940,3 +940,176 @@ pub fn spike_secret_save(
     crate::extensions::registry::secret_record(&state.store.lock().unwrap(), &id, &name, &host, "")
         .map_err(|e| e.to_string())
 }
+
+fn spike_b64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        out.push(A[((n >> 18) & 63) as usize] as char);
+        out.push(A[((n >> 12) & 63) as usize] as char);
+        out.push(if c.len() > 1 {
+            A[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            A[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Start a local signed extension catalog HTTP server serving sample `.linenext` fixtures
+/// from `corpus/generated/` and point `extensions::catalog` at it for this spike run.
+#[tauri::command]
+pub fn spike_catalog_server() -> Result<serde_json::Value, String> {
+    use crate::extensions::catalog::{CatalogCategory, CatalogDocument, CatalogEntry};
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+
+    let dict_bytes = std::fs::read(repo_root().join("corpus/generated/dictionary.linenext"))
+        .map_err(|e| format!("read dictionary.linenext: {e}"))?;
+    let owl_bytes = std::fs::read(repo_root().join("corpus/generated/night-owl.linenext"))
+        .map_err(|e| format!("read night-owl.linenext: {e}"))?;
+
+    let sha_hex = |b: &[u8]| -> String {
+        Sha256::digest(b)
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect()
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let base = format!("http://127.0.0.1:{}", addr.port());
+
+    let doc = CatalogDocument {
+        schema_version: 1,
+        generated_at: 1_764_000_000_000,
+        entries: vec![
+            CatalogEntry {
+                id: "org.example.dictionary".into(),
+                name: "Dictionary".into(),
+                summary: "Look up the selected word without leaving the page.".into(),
+                publisher: "Linen samples".into(),
+                homepage: "https://example.org/dictionary".into(),
+                category: CatalogCategory::Lookup,
+                version: "0.5.0".into(),
+                engines_linen: "^1.1".into(),
+                download_url: format!("{base}/dictionary.linenext"),
+                sha256: sha_hex(&dict_bytes),
+                size_bytes: dict_bytes.len() as u64,
+                permissions: vec![
+                    "book.selection".into(),
+                    "network:api.dictionaryapi.dev".into(),
+                ],
+                optional_permissions: vec![],
+                contributes_summary: vec![
+                    "Lookup".into(),
+                    "Command".into(),
+                    "Navigator tab".into(),
+                ],
+            },
+            CatalogEntry {
+                id: "org.example.night-owl".into(),
+                name: "Night Owl".into(),
+                summary: "A dim, low-blue theme for reading in bed.".into(),
+                publisher: "Linen samples".into(),
+                homepage: "https://example.org/night-owl".into(),
+                category: CatalogCategory::Theme,
+                version: "1.1.0".into(),
+                engines_linen: "^1.0".into(),
+                download_url: format!("{base}/night-owl.linenext"),
+                sha256: sha_hex(&owl_bytes),
+                size_bytes: owl_bytes.len() as u64,
+                permissions: vec![],
+                optional_permissions: vec![],
+                contributes_summary: vec!["Theme pack".into()],
+            },
+            CatalogEntry {
+                id: "org.example.future-reader".into(),
+                name: "Future Reader".into(),
+                summary: "Requires a newer Linen Host API.".into(),
+                publisher: "Linen samples".into(),
+                homepage: "https://example.org/future".into(),
+                category: CatalogCategory::Utility,
+                version: "2.0.0".into(),
+                engines_linen: "^2.0".into(),
+                download_url: format!("{base}/dictionary.linenext"),
+                sha256: sha_hex(&dict_bytes),
+                size_bytes: dict_bytes.len() as u64,
+                permissions: vec![],
+                optional_permissions: vec![],
+                contributes_summary: vec!["Command".into()],
+            },
+        ],
+    };
+
+    let json_bytes = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;
+
+    let sk = SigningKey::from_bytes(&[42u8; 32]);
+    let key_id = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    let mut pk_bytes = Vec::with_capacity(42);
+    pk_bytes.extend_from_slice(b"Ed");
+    pk_bytes.extend_from_slice(&key_id);
+    pk_bytes.extend_from_slice(sk.verifying_key().as_bytes());
+    let pubkey_b64 = spike_b64(&pk_bytes);
+
+    let sig = sk.sign(&json_bytes);
+    let mut sig_line = Vec::with_capacity(74);
+    sig_line.extend_from_slice(b"Ed");
+    sig_line.extend_from_slice(&key_id);
+    sig_line.extend_from_slice(&sig.to_bytes());
+    let sig_b64 = spike_b64(&sig_line);
+
+    let trusted = "timestamp:1764000000\tfile:catalog.json";
+    let mut global_msg = Vec::with_capacity(64 + trusted.len());
+    global_msg.extend_from_slice(&sig.to_bytes());
+    global_msg.extend_from_slice(trusted.as_bytes());
+    let global_b64 = spike_b64(&sk.sign(&global_msg).to_bytes());
+    let sig_bytes = format!(
+        "untrusted comment: spike catalog\n{sig_b64}\ntrusted comment: {trusted}\n{global_b64}\n"
+    )
+    .into_bytes();
+
+    let catalog_url = format!("{base}/catalog.json");
+    crate::extensions::catalog::set_spike_override(catalog_url.clone(), pubkey_b64.clone());
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(&stream);
+            let mut req_line = String::new();
+            if reader.read_line(&mut req_line).is_err() {
+                continue;
+            }
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                    break;
+                }
+            }
+            let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+            let (status, content_type, body): (&str, &str, &[u8]) = match path {
+                "/catalog.json" => ("200 OK", "application/json", &json_bytes),
+                "/catalog.json.minisig" => ("200 OK", "text/plain; charset=utf-8", &sig_bytes),
+                "/dictionary.linenext" => ("200 OK", "application/octet-stream", &dict_bytes),
+                "/night-owl.linenext" => ("200 OK", "application/octet-stream", &owl_bytes),
+                _ => ("404 Not Found", "text/plain", b"not found"),
+            };
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nETag: \"spike-v1\"\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut s = &stream;
+            let _ = s.write_all(header.as_bytes());
+            let _ = s.write_all(body);
+        }
+    });
+
+    Ok(serde_json::json!({ "url": catalog_url, "pubkey": pubkey_b64 }))
+}

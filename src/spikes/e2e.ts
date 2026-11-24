@@ -7941,6 +7941,98 @@ export async function spikeE2E(): Promise<SpikeResult> {
     },
   )
 
+  checks.push({
+    id: 'catalog-browse-install',
+    description:
+      'Settings > Extensions Browse tab fetches signed catalog, searches locally, downloads/verifies, opens consent modal, and installs',
+    optIn: true,
+    run: async () => {
+      await invoke('spike_catalog_server')
+      const existing = await invoke<{ manifest: { id: string } }[]>('extensions_list')
+      if (existing.some((x) => x.manifest.id === 'org.example.dictionary')) {
+        await invoke('extension_remove', { id: 'org.example.dictionary', deleteData: true })
+      }
+      const { default: Preferences } = await import('../prefs/Preferences.svelte')
+      const host = document.createElement('div')
+      host.style.cssText = 'position:fixed;inset:0;z-index:100;background:var(--ground)'
+      document.body.append(host)
+      mount(Preferences, { target: host })
+      try {
+        await settled(700)
+        host.querySelector<HTMLButtonElement>('#prefs-extensions')!.click()
+        await settled(800)
+        await invoke('spike_capture', { name: 'catalog-01-installed' })
+
+        const tabs = Array.from(host.querySelectorAll<HTMLButtonElement>('[role="tab"]'))
+        const browseTab = tabs.find((b) => /browse/i.test(b.textContent ?? ''))
+        if (!browseTab) return 'Browse tab not found'
+        browseTab.click()
+
+        await waitFor(
+          'catalog entries',
+          () => host.querySelector('[data-catalog-extension="org.example.dictionary"]'),
+          5000,
+        )
+        await settled(900)
+        await invoke('spike_capture', { name: 'catalog-02-browse' })
+
+        const search = host.querySelector<HTMLInputElement>('input[type="search"]')
+        if (!search) return 'Browse search input not found'
+        search.value = 'Night Owl'
+        search.dispatchEvent(new Event('input', { bubbles: true }))
+        await settled(700)
+        const filteredRows = host.querySelectorAll('[data-catalog-extension]')
+        if (filteredRows.length !== 1) return `expected 1 filtered row, got ${filteredRows.length}`
+        await invoke('spike_capture', { name: 'catalog-03-search' })
+
+        search.value = ''
+        search.dispatchEvent(new Event('input', { bubbles: true }))
+        await settled(600)
+
+        const dictRow = host.querySelector<HTMLElement>(
+          '[data-catalog-extension="org.example.dictionary"]',
+        )
+        const getBtn = dictRow?.querySelector<HTMLButtonElement>('button.primary')
+        if (!getBtn) return 'Get button for Dictionary not found'
+        getBtn.click()
+
+        const modal = await waitFor(
+          'consent modal',
+          () => host.querySelector<HTMLElement>('dialog[open]'),
+          5000,
+        )
+        await settled(900)
+        await invoke('spike_capture', { name: 'catalog-04-consent' })
+
+        const installBtn = modal.querySelector<HTMLButtonElement>('.primary')
+        if (!installBtn) return 'Install button in consent modal not found'
+        installBtn.click()
+
+        await waitFor(
+          'installed status',
+          () =>
+            /Dictionary/i.test(host.querySelector('.status')?.textContent ?? '') &&
+            !host.querySelector('dialog[open]'),
+          5000,
+        )
+        await settled(800)
+
+        const installedTab = tabs.find((b) => /installed/i.test(b.textContent ?? ''))
+        installedTab?.click()
+        await waitFor(
+          'installed Dictionary row',
+          () => host.querySelector('[data-extension="org.example.dictionary"]'),
+          5000,
+        )
+        await settled(900)
+        await invoke('spike_capture', { name: 'catalog-05-after-install' })
+        return 'ok'
+      } finally {
+        host.remove()
+      }
+    },
+  })
+
   // Last: the run itself raised no uncaught errors (the crash log holds only D1's probe).
   checks.push({
     id: 'D1-no-uncaught-errors',

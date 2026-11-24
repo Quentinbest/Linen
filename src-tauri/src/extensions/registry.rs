@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 /// P3: private storage per extension.
 pub const STORAGE_QUOTA: usize = 10 << 20;
 /// A package's files, unpacked.
-const MAX_PACKAGE: u64 = 20 << 20;
+pub const MAX_PACKAGE: u64 = 20 << 20;
 const MAX_MANIFEST: u64 = 64 << 10;
 /// net.fetch responses (the body goes to the extension as text).
 const MAX_RESPONSE: u64 = 5 << 20;

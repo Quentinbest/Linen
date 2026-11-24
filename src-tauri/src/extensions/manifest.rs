@@ -246,10 +246,14 @@ pub fn network_allows(granted: &[String], url: &str) -> bool {
 
 /// Why an extension cannot run on this build, if it cannot (P5).
 pub fn incompatibility(m: &Manifest) -> Option<String> {
-    let Ok(req) = semver::VersionReq::parse(&m.engines.linen) else {
+    incompatibility_for(&m.engines.linen)
+}
+
+/// Check a Host API semver range against the API versions this build supports (P5).
+pub fn incompatibility_for(engines_linen: &str) -> Option<String> {
+    let Ok(req) = semver::VersionReq::parse(engines_linen) else {
         return Some(format!(
-            "its required Linen API “{}” is not a version range",
-            m.engines.linen
+            "its required Linen API “{engines_linen}” is not a version range"
         ));
     };
     let current = semver::Version::parse(API_VERSION).unwrap();
@@ -264,8 +268,7 @@ pub fn incompatibility(m: &Manifest) -> Option<String> {
     });
     (!ok).then(|| {
         format!(
-            "it was built for Linen API {}; this version of Linen supports API {}",
-            m.engines.linen,
+            "it was built for Linen API {engines_linen}; this version of Linen supports API {}",
             SUPPORTED_MAJORS
                 .iter()
                 .map(|m| format!("{m}.x"))
